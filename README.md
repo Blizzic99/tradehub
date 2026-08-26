@@ -1,4 +1,4 @@
-# Alpha Scanner
+# TRADEHUB
 
 A personal options-trading research dashboard for US equities, built with
 [Streamlit](https://streamlit.io/). It surfaces dealer-hedging "magnet pin"
