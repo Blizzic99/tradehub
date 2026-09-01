@@ -33,24 +33,31 @@ except Exception:
     add_script_run_ctx = None
     get_script_run_ctx = None
 
-SCAN_WORKERS = 8   # concurrent yfinance fetches per scan phase
+SCAN_WORKERS = 6   # concurrent yfinance/Polygon fetches per scan phase. Kept moderate: too many
+                   # simultaneous yfinance calls (esp. from a shared Streamlit Cloud IP) trip Yahoo's
+                   # bot-detection -> empty frames / HTTP 429. Bump toward 8-10 for a faster LOCAL scan.
 
 def _parallel_map(fn, items):
     """Thread-pool map preserving input order, propagating the Streamlit context so cached
-    fetches work inside workers. Falls back to serial on any error so a bad pool never breaks a scan."""
+    fetches work inside workers. Each item is ISOLATED — a worker that raises yields None for THAT
+    item instead of collapsing the whole phase to serial (which would re-run everything and re-raise
+    on the bad item). One bad ticker never aborts the scan; callers treat None as a failed item."""
     items = list(items)
     if not items:
         return []
     ctx = get_script_run_ctx() if get_script_run_ctx else None
     def _wrap(item):
-        if add_script_run_ctx and ctx is not None:
-            add_script_run_ctx(ctx=ctx)
-        return fn(item)
+        try:
+            if add_script_run_ctx and ctx is not None:
+                add_script_run_ctx(ctx=ctx)
+            return fn(item)
+        except Exception:
+            return None          # isolate this item's failure; caller handles None
     try:
         with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
             return list(ex.map(_wrap, items))
     except Exception:
-        return [fn(x) for x in items]
+        return [_wrap(x) for x in items]   # pool couldn't run — serial, still per-item safe
 
 # ============================================================
 # CONFIG
@@ -423,8 +430,10 @@ def get_stock_price(ticker):
 def time_until_market_close(expiry_str):
     try:
         expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d")
-        close_time = expiry_date.replace(hour=15, minute=50, second=0)
-        now = datetime.now()
+        # Anchor to 3:50 PM ET explicitly. Without tz, datetime.now() is the server clock (UTC on
+        # Streamlit Cloud, local time elsewhere) and the countdown is off by hours.
+        close_time = expiry_date.replace(hour=15, minute=50, second=0, tzinfo=ET_ZONE)
+        now = datetime.now(ET_ZONE)
         diff = close_time - now
         if diff.total_seconds() < 0:
             return "EXPIRED - CLOSE IMMEDIATELY"
@@ -820,10 +829,16 @@ def get_intraday_minute_bars(ticker):
     freshness but spares ~49 fetches on incidental Streamlit reruns."""
     if INTRADAY_SOURCE == "polygon":
         df = _intraday_polygon(ticker)
-        if not df.empty:
-            return df
-        return _intraday_yfinance(ticker)   # graceful fallback if plan blocks the timeframe
-    return _intraday_yfinance(ticker)
+        if df.empty:
+            df = _intraday_yfinance(ticker)   # graceful fallback if plan blocks the timeframe
+    else:
+        df = _intraday_yfinance(ticker)
+    # Only ever present TODAY's session. period="1d" returns Friday's bars on a weekend, and the
+    # Polygon path walks back to the last day WITH data — either would make the VWAP/ORB scanners
+    # compute on stale bars and label them as live. If the latest bar isn't today (ET), show nothing.
+    if not df.empty and df.index[-1].date() != datetime.now(ET_ZONE).date():
+        return pd.DataFrame()
+    return df
 
 def compute_session_vwap(df):
     """Running session VWAP aligned to df index (typical price * volume, cumulative)."""
@@ -2201,7 +2216,12 @@ if not st.session_state.initial_scan_done or re_scan:
         st.subheader("Magnet Pin Signals (Dealer Hedging Targets)")
         with st.spinner("Calculating max pain for watchlist..."):
             mp_results = _parallel_map(get_max_pain_strike, CORE_WATCHLIST)   # concurrent fetch
-            for ticker, (max_pain, current_price, expiry, total_oi, atm_iv, skew) in zip(CORE_WATCHLIST, mp_results):
+            failed_tickers = []   # tickers with no usable options data (fetch failure / rate-limit / none listed)
+            for ticker, res in zip(CORE_WATCHLIST, mp_results):
+                if res is None:                       # worker raised (isolated by _parallel_map)
+                    failed_tickers.append(ticker)
+                    continue
+                max_pain, current_price, expiry, total_oi, atm_iv, skew = res
                 record_iv(ticker, atm_iv)     # full-watchlist daily IV logging (main thread — no file race)
                 record_skew(ticker, skew)     # full-watchlist daily skew logging (main thread)
                 if max_pain and current_price:
@@ -2231,6 +2251,13 @@ if not st.session_state.initial_scan_done or re_scan:
                         "_trigger_dt": datetime.now(ET_ZONE),
                         "_skew": skew,
                     })
+                else:
+                    failed_tickers.append(ticker)   # fetch returned no max-pain/price for this ticker
+
+        if failed_tickers:
+            st.caption("⚠️ No options data for " + str(len(failed_tickers)) + "/"
+                       + str(len(CORE_WATCHLIST)) + ": " + ", ".join(failed_tickers)
+                       + " — timeout, rate-limit, or no listed options (not a signal-quality issue).")
 
         if magnet_results:
             df_magnet = pd.DataFrame(magnet_results)
