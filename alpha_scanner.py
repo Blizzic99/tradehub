@@ -14,6 +14,7 @@ import yfinance as yf
 import requests
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from math import log, sqrt
 from statistics import NormalDist
@@ -32,6 +33,40 @@ try:
 except Exception:
     add_script_run_ctx = None
     get_script_run_ctx = None
+
+# --- Yahoo Finance access hardening ---------------------------------------------------------------
+# Yahoo blocks/throttles datacenter IPs (Streamlit Community Cloud is one), which is why the hosted
+# app can't pull option chains while a local run works. A curl_cffi session that impersonates Chrome
+# gives a real-browser TLS fingerprint + persistent crumb/cookies, which often gets past that
+# throttling. Created once, reused everywhere; falls back to a plain Ticker if curl_cffi is absent.
+try:
+    from curl_cffi import requests as _cffi_requests
+    _YF_SESSION = _cffi_requests.Session(impersonate="chrome")
+except Exception:
+    _YF_SESSION = None
+
+def _yf_ticker(ticker):
+    """yf.Ticker on the browser-impersonating session when available (helps past cloud throttling)."""
+    if _YF_SESSION is not None:
+        try:
+            return yf.Ticker(ticker, session=_YF_SESSION)
+        except Exception:
+            pass
+    return yf.Ticker(ticker)
+
+def _yf_options(stock, retries=1, pause=0.7):
+    """stock.options with a light retry — under load Yahoo intermittently returns an empty list or
+    raises; one short retry recovers many of those without meaningfully slowing a healthy scan."""
+    for attempt in range(retries + 1):
+        try:
+            exps = stock.options
+            if exps:
+                return exps
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(pause)
+    return ()
 
 SCAN_WORKERS = 6   # concurrent yfinance/Polygon fetches per scan phase. Kept moderate: too many
                    # simultaneous yfinance calls (esp. from a shared Streamlit Cloud IP) trip Yahoo's
@@ -397,9 +432,9 @@ def get_open_trades():
 
 def get_option_price(ticker, strike, direction, expiry):
     try:
-        stock = yf.Ticker(ticker)
+        stock = _yf_ticker(ticker)
         exp_date = None
-        for exp in stock.options:
+        for exp in _yf_options(stock):
             if exp >= expiry:
                 exp_date = exp
                 break
@@ -424,7 +459,7 @@ def get_option_price(ticker, strike, direction, expiry):
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_price(ticker):
     try:
-        stock = yf.Ticker(ticker)
+        stock = _yf_ticker(ticker)
         hist = stock.history(period="1d")
         if not hist.empty:
             return hist["Close"].iloc[-1]
@@ -576,8 +611,8 @@ def get_top_option_volume_tickers(limit=50):
         ]
         def _vol_for(ticker):
             try:
-                stock = yf.Ticker(ticker)
-                opt_dates = stock.options
+                stock = _yf_ticker(ticker)
+                opt_dates = _yf_options(stock)
                 if not opt_dates:
                     return (ticker, None)
                 chain = stock.option_chain(opt_dates[0])
@@ -599,8 +634,8 @@ def get_max_pain_strike(ticker):
     OI-at-pin, ATM IV (daily IV log) AND 25-delta skew (daily skew log) are all computed here from
     the same chain, so none needs a second network fetch. Cached 120s so reruns are free."""
     try:
-        stock = yf.Ticker(ticker)
-        expirations = stock.options
+        stock = _yf_ticker(ticker)
+        expirations = _yf_options(stock)
         if not expirations:
             return None, None, None, 0, None, None
         today = datetime.now().date()
@@ -706,7 +741,7 @@ def get_max_pain_strike(ticker):
 @st.cache_data(ttl=300, show_spinner=False)
 def check_parabolic_condition(ticker):
     try:
-        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        df = yf.download(ticker, period="3mo", interval="1d", progress=False, session=_YF_SESSION)
         if df.empty or len(df) < 20:
             return False, None, None, None
         close = df["Close"].values
@@ -794,7 +829,7 @@ def _normalize_intraday(df):
 
 def _intraday_yfinance(ticker):
     try:
-        stock = yf.Ticker(ticker)
+        stock = _yf_ticker(ticker)
         df = stock.history(period="1d", interval="1m")
         return _normalize_intraday(df)
     except Exception:
@@ -1019,7 +1054,7 @@ def scan_intraday_setups(tickers, vix=None):
 def get_market_context():
     context = {}
     try:
-        vix = yf.Ticker("^VIX")
+        vix = _yf_ticker("^VIX")
         vix_hist = vix.history(period="2d")
         if not vix_hist.empty and len(vix_hist) >= 1:
             current_vix = vix_hist["Close"].iloc[-1]
@@ -1031,7 +1066,7 @@ def get_market_context():
             context["vix"] = "N/A"
             context["vix_change"] = "N/A"
 
-        spy = yf.Ticker("SPY")
+        spy = _yf_ticker("SPY")
         spy_hist = spy.history(period="5d")
         if not spy_hist.empty and len(spy_hist) >= 2:
             closes = spy_hist["Close"].dropna()
@@ -1099,8 +1134,8 @@ def get_option_chain_snapshot(ticker):
     year-fraction to expiry. Cached by ticker (120s) so repeated reruns are free.
     Returns None on any failure."""
     try:
-        stock = yf.Ticker(ticker)
-        exps = stock.options
+        stock = _yf_ticker(ticker)
+        exps = _yf_options(stock)
         if not exps:
             return None
         today = datetime.now().date()
@@ -1650,7 +1685,7 @@ def realized_vol_series(ticker):
     """Sorted rolling-21-day annualized realized-vol values over ~the last year — the distribution
     the PROXY ranks current IV against while real IV history is still building. [] on failure."""
     try:
-        df = yf.download(ticker, period="1y", interval="1d", progress=False)
+        df = yf.download(ticker, period="1y", interval="1d", progress=False, session=_YF_SESSION)
         if df is None or df.empty or len(df) < 30:
             return []
         close = df["Close"]
@@ -1794,7 +1829,7 @@ def _pm_bt(df, a, b):
 
 def _pm_download_one(tk, **kw):
     try:
-        d = yf.download(tk, progress=False, auto_adjust=False, **kw)
+        d = yf.download(tk, progress=False, auto_adjust=False, session=_YF_SESSION, **kw)
     except Exception:
         return pd.DataFrame()
     if d is None or len(d) == 0:
@@ -1813,12 +1848,12 @@ def pm_fetch(tickers):
     intra, daily = {}, {}
     try:
         raw5 = yf.download(tickers, period="60d", interval="5m", prepost=True, group_by="ticker",
-                           progress=False, auto_adjust=False, threads=True)
+                           progress=False, auto_adjust=False, threads=True, session=_YF_SESSION)
     except Exception:
         raw5 = None
     try:
         rawd = yf.download(tickers, period="30d", interval="1d", group_by="ticker",
-                           progress=False, auto_adjust=False, threads=True)
+                           progress=False, auto_adjust=False, threads=True, session=_YF_SESSION)
     except Exception:
         rawd = None
     for tk in tickers:
