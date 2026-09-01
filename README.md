@@ -28,6 +28,8 @@ pre-market context view — plus a trade journal and optional Telegram alerts.
 - **⏱ Intraday** — opening-range-breakout (ORB) and VWAP-reclaim setups.
 - **🌅 Pre-Market** — overnight gap, gap-vs-typical proxy, prior-day levels,
   VIX regime, and sector-ETF context.
+- **🌐 Futures** — a GREEN/AMBER/RED field-condition gauge from index futures
+  (ES/NQ/YM/RTY), crude, gold, Treasuries, the dollar index, and VIX.
 - **📓 Journal & Trades** — log/track trades, performance analytics, and an
   active-trade tracker.
 - **Telegram alerts** — optional push notifications for qualifying signals.
