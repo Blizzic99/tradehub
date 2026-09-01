@@ -309,7 +309,6 @@ _asc = _load_scanner_module()
 # The single source of truth — imported, never redefined.
 INTRADAY_VOL_CONFIRM        = _asc.INTRADAY_VOL_CONFIRM
 VWAP_OPENING_WINDOW_MINUTES = _asc.VWAP_OPENING_WINDOW_MINUTES
-VWAP_RECLAIM_CUTOFF_HOUR    = _asc.VWAP_RECLAIM_CUTOFF_HOUR
 ORB_RANGE_MINUTES           = _asc.ORB_RANGE_MINUTES
 ORB_MIN_RANGE_PCT           = _asc.ORB_MIN_RANGE_PCT
 ORB_BREAK_BUFFER_FRAC       = _asc.ORB_BREAK_BUFFER_FRAC
@@ -340,17 +339,20 @@ def detect_vwap_entry(session_df, vwap_series, vol_confirm=None):
 
     Enforced in order: (1) price dipped below VWAP within the first VWAP_OPENING_WINDOW_MINUTES;
     (2) a later bar CLOSES back above VWAP (the reclaim bar = the fire point); (3) that bar's volume
-    exceeds INTRADAY_VOL_CONFIRM x the causal average volume up to & including it; (4) the reclaim is
-    before VWAP_RECLAIM_CUTOFF_HOUR ET. The fire bar index is returned; the simulator enters at the
-    NEXT bar's open (never on the signal bar itself).
+    exceeds INTRADAY_VOL_CONFIRM x the causal average volume up to & including it; (4) the reclaim bar
+    ALSO falls inside the 9:30-10:00 ET opening window (matches the live scanner). The fire bar index
+    is returned; the simulator enters at the NEXT bar's open (never on the signal bar itself).
     """
     vc = INTRADAY_VOL_CONFIRM if vol_confirm is None else float(vol_confirm)
     df = session_df
     if df is None or len(df) < VWAP_OPENING_WINDOW_MINUTES + 2:
         return None
     vwap = vwap_series
-    session_start = df.index[0]
-    opening_cutoff = session_start + timedelta(minutes=VWAP_OPENING_WINDOW_MINUTES)
+    # Anchor the opening window to the ACTUAL 9:30 ET open (matches the live _vwap_reclaim_row),
+    # not df.index[0] — BOTH the dip and the reclaim must fall inside 9:30-10:00 ET.
+    _sd = df.index[0].date()
+    market_open = pd.Timestamp(_sd.year, _sd.month, _sd.day, 9, 30, tz=df.index.tz)
+    opening_cutoff = market_open + timedelta(minutes=VWAP_OPENING_WINDOW_MINUTES)   # 10:00 ET
     opening_mask = df.index < opening_cutoff
     below = df["close"] < vwap
 
@@ -372,8 +374,10 @@ def detect_vwap_entry(session_df, vwap_series, vol_confirm=None):
     if reclaim_pos is None:
         return None
 
-    # (4) reclaim must occur before the early-afternoon cutoff (little runway after)
-    if df.index[reclaim_pos].hour >= VWAP_RECLAIM_CUTOFF_HOUR:
+    # (4) the RECLAIM must fall inside the 9:30-10:00 ET opening window — keeps this backtest
+    # logic-identical to the live _vwap_reclaim_row (was a 1:00 PM cutoff; changed 2026-09-01 so a
+    # late reclaim at 10:59/11:35 is not counted as an entry, matching the live scanner).
+    if df.index[reclaim_pos] >= opening_cutoff:
         return None
 
     # (3) reclaim-bar volume vs the CAUSAL average up to & including it (strict no-lookahead)

@@ -753,9 +753,8 @@ ORB_REQUIRE_HOLD = True                # breakout invalid if price has fallen ba
 ORB_MAX_RESULTS = 15                    # display only the top-N breakouts (ranked by volume conviction)
 # --- VWAP-reclaim regime/timing gates ---
 VWAP_MAX_VIX = 25.0                    # skip VWAP-reclaim signals when VIX is above this (high-fear regime)
-VWAP_RECLAIM_CUTOFF_HOUR = 13          # BACKTEST ONLY (alpha_backtest.detect_vwap_entry). The LIVE
-                                       # scanner no longer uses this — _vwap_reclaim_row now requires
-                                       # the reclaim INSIDE the 9:30-10:00 ET opening window.
+# (Reclaim timing is enforced directly in _vwap_reclaim_row: dip AND reclaim must both be inside the
+#  first VWAP_OPENING_WINDOW_MINUTES, i.e. 9:30-10:00 ET. No separate cutoff-hour constant.)
 # ET_ZONE (DST-aware) is defined once near the top of the file.
 
 def _normalize_intraday(df):
