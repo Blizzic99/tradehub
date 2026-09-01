@@ -753,7 +753,9 @@ ORB_REQUIRE_HOLD = True                # breakout invalid if price has fallen ba
 ORB_MAX_RESULTS = 15                    # display only the top-N breakouts (ranked by volume conviction)
 # --- VWAP-reclaim regime/timing gates ---
 VWAP_MAX_VIX = 25.0                    # skip VWAP-reclaim signals when VIX is above this (high-fear regime)
-VWAP_RECLAIM_CUTOFF_HOUR = 13          # ignore reclaims at/after 1:00 PM ET (late reclaims have little runway)
+VWAP_RECLAIM_CUTOFF_HOUR = 13          # BACKTEST ONLY (alpha_backtest.detect_vwap_entry). The LIVE
+                                       # scanner no longer uses this — _vwap_reclaim_row now requires
+                                       # the reclaim INSIDE the 9:30-10:00 ET opening window.
 # ET_ZONE (DST-aware) is defined once near the top of the file.
 
 def _normalize_intraday(df):
@@ -832,20 +834,23 @@ def compute_session_vwap(df):
     return cum_pv / cum_vol.replace(0, np.nan)
 
 def _vwap_reclaim_row(ticker, df, vix=None):
-    """Return a result dict only for a genuine dip-then-reclaim sequence, else None.
+    """Return a result dict only for a genuine EARLY-SESSION dip-then-reclaim sequence, else None.
     The signal is NOT "price is currently above VWAP" — it requires, in order:
-      1. price traded BELOW VWAP within the opening window (a real dip),
-      2. a later candle CLOSED back above VWAP (the reclaim candle),
+      1. price traded BELOW VWAP within the opening window, 9:30-10:00 ET (a real dip),
+      2. a later candle CLOSED back above VWAP — the reclaim — ALSO within 9:30-10:00 ET,
       3. price is STILL holding above VWAP on the latest bar,
       4. the reclaim candle's volume beat the running average,
-    plus two regime/timing gates: VIX must be calm and the reclaim must be before
-    the early-afternoon cutoff."""
+    plus a VIX regime gate. A reclaim after 10:00 ET is rejected (returns None) — a late
+    reclaim like 10:59 or 11:35 is not this setup."""
     # Gate A: high-fear regime — mean-reversion-style intraday setups are unreliable when VIX is elevated.
     if isinstance(vix, (int, float)) and vix > VWAP_MAX_VIX:
         return None
     vwap = compute_session_vwap(df)
-    session_start = df.index[0]
-    opening_cutoff = session_start + timedelta(minutes=VWAP_OPENING_WINDOW_MINUTES)
+    # Anchor the opening window to the ACTUAL 9:30 ET open (robust to a missing first bar) rather
+    # than df.index[0]. BOTH the dip AND the reclaim must fall inside this window (9:30-10:00 ET).
+    _sd = df.index[0].date()
+    market_open = pd.Timestamp(_sd.year, _sd.month, _sd.day, 9, 30, tz=df.index.tz)
+    opening_cutoff = market_open + timedelta(minutes=VWAP_OPENING_WINDOW_MINUTES)   # 10:00 ET
     opening_mask = df.index < opening_cutoff
     below = df["close"] < vwap
     # Step 1: price must have actually traded below VWAP during the opening window (the dip).
@@ -864,8 +869,11 @@ def _vwap_reclaim_row(ticker, df, vix=None):
             break
     if reclaim_pos is None:
         return None
-    # Gate B: ignore late reclaims — a reclaim at/after 1:00 PM ET has little runway left in the session.
-    if df.index[reclaim_pos].hour >= VWAP_RECLAIM_CUTOFF_HOUR:
+    # Gate B: the RECLAIM candle itself must fall INSIDE the opening window (9:30-10:00 ET). A dip
+    # early followed by a reclaim at 10:59 or 11:35 is NOT the setup — only genuine early-session
+    # reclaims qualify. (Stricter than the old 1:00 PM cutoff, which let late reclaims through — the
+    # bug that flagged ASML @ 11:35 and KLAC @ 10:59 as valid LONGs.)
+    if df.index[reclaim_pos] >= opening_cutoff:
         return None
     # Step 3: must still be holding above VWAP now (a reclaim that already failed back below is dead).
     if df["close"].iloc[-1] <= vwap.iloc[-1]:
@@ -2349,11 +2357,12 @@ if not st.session_state.initial_scan_done or re_scan:
                     CORE_WATCHLIST, vix=market_context.get("vix"))
 
         st.subheader("VWAP Reclaim Setups")
-        st.caption("Genuine dip-then-reclaim: price traded BELOW VWAP within the first "
-                   + str(VWAP_OPENING_WINDOW_MINUTES) + " min, a later candle CLOSED back above it on volume > "
-                   + str(INTRADAY_VOL_CONFIRM) + "x average, and price is STILL holding above. "
-                   + "Skipped when VIX > " + str(VWAP_MAX_VIX) + " or the reclaim is at/after "
-                   + str(VWAP_RECLAIM_CUTOFF_HOUR) + ":00 ET. Source: " + INTRADAY_SOURCE + ".")
+        st.caption("Genuine early-session dip-then-reclaim: BOTH the dip below VWAP and the reclaim "
+                   "candle that CLOSES back above it must occur within the first "
+                   + str(VWAP_OPENING_WINDOW_MINUTES) + " min (9:30-10:00 ET), on volume > "
+                   + str(INTRADAY_VOL_CONFIRM) + "x average, with price STILL holding above. Reclaims "
+                   "after 10:00 ET are rejected and not shown. Skipped when VIX > "
+                   + str(VWAP_MAX_VIX) + ". Source: " + INTRADAY_SOURCE + ".")
         if not run_intraday:
             st.info("Intraday scan is off (saves one fetch per ticker). Enable 'Run intraday VWAP/ORB scan' in the sidebar.")
         elif intraday_data_count == 0:
