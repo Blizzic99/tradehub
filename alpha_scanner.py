@@ -597,6 +597,35 @@ CORE_WATCHLIST = [
 ]
 
 # ============================================================
+# FUTURES CONTEXT (Level 7) — risk/reward regime from Yahoo Finance futures.
+# Separate fetch from the pre-market cache. Not a signal — a FIELD-CONDITION gauge.
+# ============================================================
+FUTURES_WATCHLIST = {
+    "ES": "ES=F",      # S&P 500 E-mini
+    "NQ": "NQ=F",      # Nasdaq-100 E-mini
+    "YM": "YM=F",      # Dow E-mini
+    "RTY": "RTY=F",    # Russell 2000 E-mini
+    "CL": "CL=F",      # Crude Oil WTI
+    "GC": "GC=F",      # Gold
+    "ZB": "ZB=F",      # 30-yr Treasury Bond
+    "ZN": "ZN=F",      # 10-yr Treasury Note
+    "DX": "DX-Y.NYB",  # US Dollar Index (ICE spot index — Yahoo's DX=F future 404s)
+}
+
+# Risk/reward thresholds — tuned for overnight / pre-market futures (change % vs prior close).
+FUTURES_RISK_OFF = {
+    "ES": -0.50,       # S&P futures down > 0.5%
+    "NQ": -0.75,       # Nasdaq down > 0.75%
+    "CL": 1.50,        # Oil up > 1.5% (inflation / geopolitical shock)
+    "VIX": 22.0,       # VIX above 22 = fear regime
+}
+FUTURES_RISK_ON = {
+    "ES": 0.25,        # S&P futures up > 0.25%
+    "NQ": 0.35,        # Nasdaq up > 0.35%
+    "CL": -0.50,       # Oil down or flat (no energy stress)
+}
+
+# ============================================================
 # HELPER FUNCTIONS
 # ============================================================
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1126,6 +1155,102 @@ RISK_FREE_RATE = 0.045       # annual risk-free rate (per spec)
 STOP_BUFFER = 0.0075         # 0.75% stop offset from the breakout / magnet level
 MAGNET_TARGET_OFFSET = 0.30  # exit ~$0.30 before the max-pain pin ($0.20-$0.50 band)
 _NORM = NormalDist()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_futures_data():
+    """Latest daily quote per FUTURES_WATCHLIST contract. Uses ONE batched Yahoo download (fewer
+    requests = far less rate-limit risk than 9 individual calls) through the browser session, then
+    retries individually for any contract the batch drops. Returns
+    {short: {price, prev_close, change_pct, trend}} — value is None per contract on failure."""
+    out = {short: None for short in FUTURES_WATCHLIST}
+    tickers = list(FUTURES_WATCHLIST.values())
+
+    def _parse(df):
+        if df is None or df.empty:
+            return None
+        close = df["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        closes = close.dropna()
+        if len(closes) < 2:
+            return None
+        prev_close, last = float(closes.iloc[-2]), float(closes.iloc[-1])
+        change_pct = ((last - prev_close) / prev_close) * 100 if prev_close else 0.0
+        return {"price": last, "prev_close": prev_close, "change_pct": change_pct,
+                "trend": "UP" if last >= prev_close else "DOWN"}
+
+    try:
+        raw = yf.download(tickers, period="2d", interval="1d", group_by="ticker",
+                          progress=False, auto_adjust=False, threads=True, session=_YF_SESSION)
+    except Exception:
+        raw = None
+    cols0 = []
+    if raw is not None and hasattr(raw, "columns"):
+        try:
+            cols0 = list(raw.columns.get_level_values(0))
+        except Exception:
+            cols0 = list(raw.columns)
+    for short, tk in FUTURES_WATCHLIST.items():
+        if tk in cols0:
+            try:
+                out[short] = _parse(raw[tk])
+            except Exception:
+                out[short] = None
+    for short, tk in FUTURES_WATCHLIST.items():        # individual retry for anything the batch dropped
+        if out[short] is None:
+            try:
+                out[short] = _parse(yf.download(tk, period="2d", interval="1d",
+                                                progress=False, session=_YF_SESSION))
+            except Exception:
+                out[short] = None
+    return out
+
+def get_futures_regime(futures_data, vix=None):
+    """Classify field conditions from futures + VIX. Returns (regime, risks) where regime is
+    GREEN / AMBER / RED and risks is a list of the specific reasons that drove it."""
+    risks = []
+    regime = "GREEN"
+
+    # --- VIX gate ---
+    if vix is not None and vix >= FUTURES_RISK_OFF["VIX"]:
+        risks.append(f"VIX {vix:.1f} >= {FUTURES_RISK_OFF['VIX']:.1f}")
+        regime = "RED"
+
+    # --- Equity futures stress ---
+    es = futures_data.get("ES")
+    nq = futures_data.get("NQ")
+    if es and es.get("change_pct", 0) <= FUTURES_RISK_OFF["ES"]:
+        risks.append(f"ES {es['change_pct']:.2f}% <= {FUTURES_RISK_OFF['ES']}%")
+        regime = "RED"
+    if nq and nq.get("change_pct", 0) <= FUTURES_RISK_OFF["NQ"]:
+        risks.append(f"NQ {nq['change_pct']:.2f}% <= {FUTURES_RISK_OFF['NQ']}%")
+        regime = "RED"
+
+    # --- Crude oil shock ---
+    cl = futures_data.get("CL")
+    if cl and cl.get("change_pct", 0) >= FUTURES_RISK_OFF["CL"]:
+        risks.append(f"Oil +{cl['change_pct']:.2f}% >= +{FUTURES_RISK_OFF['CL']}%")
+        regime = "RED"
+
+    # --- Defensive rotation (Treasuries + Gold strong while equity flat) ---
+    zb = futures_data.get("ZB")
+    zn = futures_data.get("ZN")
+    gc = futures_data.get("GC")
+    if regime != "RED" and es is not None and abs(es.get("change_pct", 0)) < 0.2:
+        if (zb and zb.get("trend") == "UP") or (zn and zn.get("trend") == "UP"):
+            if gc and gc.get("trend") == "UP":
+                risks.append("Flight to safety: Treasuries + Gold UP while ES flat")
+                regime = "AMBER"
+
+    # --- Strong risk-on note (GREEN only) ---
+    if regime == "GREEN":
+        if es and es.get("change_pct", 0) >= FUTURES_RISK_ON["ES"]:
+            if nq and nq.get("change_pct", 0) >= FUTURES_RISK_ON["NQ"]:
+                risks.append("Risk-on: ES + NQ both up")
+            else:
+                risks.append("ES up, NQ lagging — mixed")
+
+    return regime, risks
 
 @st.cache_data(ttl=120, show_spinner=False)
 def get_option_chain_snapshot(ticker):
@@ -2192,8 +2317,8 @@ if not st.session_state.initial_scan_done or re_scan:
     # Top-of-page verdict strip (a placeholder filled after the scan computes below)
     scorecard = st.container()
 
-    tab_premarket, tab_magnet, tab_intraday, tab_blowoff, tab_journal = st.tabs(
-        ["🌅 Pre-Market", "🎯 Magnet Pins", "⏱ Intraday", "🔥 Blow-Offs", "📓 Journal & Trades"]
+    tab_premarket, tab_futures, tab_magnet, tab_intraday, tab_blowoff, tab_journal = st.tabs(
+        ["🌅 Pre-Market", "🌐 Futures", "🎯 Magnet Pins", "⏱ Intraday", "🔥 Blow-Offs", "📓 Journal & Trades"]
     )
 
     # ============================================================
@@ -2248,6 +2373,60 @@ if not st.session_state.initial_scan_done or re_scan:
             else:
                 st.info("No pre-market data available (weekend / holiday / before ~4:00 AM ET, or Yahoo has no "
                         "pre-market prints yet). Yahoo serves pre-market prices only during/after the session.")
+
+    # ============================================================
+    # TAB 0.5 — FUTURES REGIME (risk/reward gauge)
+    # ============================================================
+    with tab_futures:
+        st.subheader("Futures Regime")
+        st.caption("Field-condition gauge, not a trade signal. The risk/reward of every magnet pin "
+                   "and intraday setup depends on whether futures are calm (GREEN), stressed "
+                   "(AMBER), or hostile (RED).")
+
+        with st.spinner("Fetching futures..."):
+            futures_data = get_futures_data()
+
+        if futures_data and any(v for v in futures_data.values()):
+            regime, risks = get_futures_regime(futures_data, vix=market_context.get("vix"))
+            regime_text = C_GREEN if regime == "GREEN" else (C_ACCENT if regime == "AMBER" else C_RED)
+            # Banner detail is regime-appropriate: for GREEN, 'risks' holds the risk-on / calm note;
+            # for AMBER/RED it holds the stress reasons. Either way, list them plainly (no misleading
+            # "favorable" label on a hostile tape).
+            detail = ", ".join(risks) if risks else "No stress signals — conditions are calm."
+
+            st.markdown(f"""
+            <div style="background:{C_SURFACE}; border:1px solid {C_BORDER}; border-radius:10px;
+                        padding:16px; margin-bottom:16px; border-left:4px solid {regime_text};">
+              <div style="font-size:1.2rem; font-weight:700; color:{regime_text};">{regime} LIGHT</div>
+              <div style="color:{C_MUTED}; font-size:0.9rem; margin-top:4px;">{detail}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            rows = []
+            for short, data in futures_data.items():
+                if data:
+                    rows.append({
+                        "Contract": short,
+                        "Price": f"${data['price']:.2f}",
+                        "Prev Close": f"${data['prev_close']:.2f}",
+                        "Change %": f"{data['change_pct']:+.2f}%",
+                        "Trend": data["trend"],
+                    })
+            if rows:
+                df_futures = pd.DataFrame(rows)
+
+                def _color_futures_change(v):
+                    s = str(v)
+                    if s.startswith("+"): return f"color: {C_GREEN}; font-weight: 600"
+                    if s.startswith("-"): return f"color: {C_RED}; font-weight: 600"
+                    return ""
+
+                st.dataframe(df_futures.style.map(_color_futures_change, subset=["Change %"]),
+                             width="stretch", hide_index=True)
+            st.caption("Change % is the latest daily bar vs the prior close. ES/NQ/YM/RTY = equity "
+                       "index futures; CL = crude, GC = gold, ZB/ZN = Treasuries, DX = dollar index.")
+        else:
+            st.info("No futures data available (Yahoo connectivity / rate-limit). Try REFRESH SCAN.")
 
     # ============================================================
     # TAB 1 — MAGNET PINS
