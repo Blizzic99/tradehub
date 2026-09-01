@@ -313,22 +313,27 @@ def delete_trade(index):
         journal.pop(index)
         save_journal(journal)
 
+# 1 US equity option contract = 100 shares; entry/exit prices are premiums, so dollar P&L per
+# contract = (premium move) * 100. Named so the journal + analytics stay consistent.
+OPTION_CONTRACT_MULTIPLIER = 100
+
 def get_journal_stats(journal):
     if not journal:
         return {"total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0, "total_pnl": 0}
     total = len(journal)
     wins = sum(1 for t in journal if t["result"] == "WIN")
     losses = sum(1 for t in journal if t["result"] == "LOSS")
-    win_rate = round((wins / total) * 100, 1) if total > 0 else 0
+    closed = wins + losses          # win rate excludes OPEN trades from the denominator
+    win_rate = round((wins / closed) * 100, 1) if closed > 0 else 0
     total_pnl = 0
     for t in journal:
         try:
             entry = float(t["entry_price"])
             exit_p = float(t["exit_price"])
             if t["direction"] == "CALL":
-                total_pnl += exit_p - entry
+                total_pnl += (exit_p - entry) * OPTION_CONTRACT_MULTIPLIER
             else:
-                total_pnl += entry - exit_p
+                total_pnl += (entry - exit_p) * OPTION_CONTRACT_MULTIPLIER
         except:
             pass
     return {
@@ -349,9 +354,9 @@ def get_performance_analytics(journal):
         except:
             continue
         if t.get("direction") == "CALL":
-            pnls.append(exit_p - entry)
+            pnls.append((exit_p - entry) * OPTION_CONTRACT_MULTIPLIER)
         else:
-            pnls.append(entry - exit_p)
+            pnls.append((entry - exit_p) * OPTION_CONTRACT_MULTIPLIER)
     if not pnls:
         return None
     gross_profit = sum(p for p in pnls if p > 0)
@@ -2313,7 +2318,15 @@ if not st.session_state.initial_scan_done or re_scan:
                 if enable_alerts and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                     oi_str = str(best.get("OI Confidence", ""))
                     oi_qualifies = "HIGH" in oi_str or "MEDIUM" in oi_str
-                    if oi_qualifies and should_send_alert(best):
+                    # Only alert on a genuinely tradeable pin — within 1% of the magnet, matching the
+                    # Trade Readiness gate (compute_readiness). Was OI-only, so a MODERATE pin up to
+                    # ~4% away could still ping.
+                    try:
+                        dist_pct = abs(float(str(best.get("Distance %", "100%")).rstrip("%")))
+                    except Exception:
+                        dist_pct = 100.0
+                    dist_qualifies = dist_pct < READINESS_MAX_DIST_PCT
+                    if oi_qualifies and dist_qualifies and should_send_alert(best):
                         msg = generate_alert_message(best)
                         success = send_telegram_alert(msg)
                         if success:
