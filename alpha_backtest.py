@@ -59,15 +59,37 @@ HALF_DAY_MIN_BARS = 350
 # same secrets.toml/env works, WITHOUT importing the Streamlit app.
 # ------------------------------------------------------------------
 def _secret(name, default=""):
-    """Read a secret from Streamlit secrets (.streamlit/secrets.toml) first, then env, else default.
-    Streamlit is imported lazily and all failures are swallowed so this works standalone (no runtime)."""
-    try:
-        import streamlit as st  # lazy: only if available / a secrets.toml is discoverable
-        if name in st.secrets:
-            return st.secrets[name]
-    except Exception:
-        pass
-    return os.environ.get(name, default)
+    """Read a secret: env var first, then .streamlit/secrets.toml NEXT TO THIS SCRIPT (and the
+    user's ~/.streamlit/secrets.toml). We read the TOML file directly rather than via st.secrets,
+    because this backtest import-stubs Streamlit (see _install_import_stubs) — so st.secrets is
+    inert here. Anchored to __file__, so the temp-dir chdir during scanner load can't hide it."""
+    v = os.environ.get(name)
+    if v:
+        return v
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, ".streamlit", "secrets.toml"),
+                 os.path.join(os.path.expanduser("~"), ".streamlit", "secrets.toml")):
+        if not os.path.exists(path):
+            continue
+        try:                                        # preferred: real TOML parse (stdlib 3.11+)
+            import tomllib
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+            if name in data:
+                return data[name]
+        except Exception:                           # fallback: minimal KEY = "value" line parse
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s.startswith("#") or "=" not in s:
+                            continue
+                        k, _, val = s.partition("=")
+                        if k.strip() == name:
+                            return val.strip().strip('"').strip("'")
+            except Exception:
+                pass
+    return default
 
 
 def _polygon_key():
