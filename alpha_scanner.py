@@ -1540,6 +1540,57 @@ def record_skew(ticker, skew):
     h[ticker] = lst[-SKEW_HISTORY_CAP:]
     save_skew_history(h)
 
+# ------------------------------------------------------------
+# MAGNET-PIN FORWARD TEST (Level 8) — historical option OI isn't available on the free tier, so
+# max-pain pins can't be backtested retrospectively. Instead we LOG each day's pin prediction here
+# and evaluate convergence AFTER each expiry passes (no lookahead). Consumed by
+# alpha_backtest.magnet_forward_report(). Measures the UNDERLYING's move toward the pin, NOT option
+# P&L (no theta/spread modeled) — same caveat as the ORB/VWAP backtest.
+# ------------------------------------------------------------
+MAGNET_HISTORY_FILE = "magnet_history.json"
+MAGNET_HISTORY_CAP = 400          # snapshots kept per ticker (~1.5yr of daily entries)
+
+def load_magnet_history():
+    if os.path.exists(MAGNET_HISTORY_FILE):
+        try:
+            with open(MAGNET_HISTORY_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_magnet_history(h):
+    try:
+        with open(MAGNET_HISTORY_FILE, "w") as f:
+            json.dump(h, f)
+    except Exception:
+        pass
+
+def record_magnet(ticker, max_pain, spot, expiry):
+    """Log today's magnet-pin prediction: the max-pain pin, the spot at log time, and the nearest
+    expiry it targets. Deduped per day (last scan of the day wins), capped. Main thread. Evaluated
+    later (once the expiry has passed) by alpha_backtest.magnet_forward_report — strictly no lookahead."""
+    if ticker is None or max_pain is None or spot is None or expiry is None:
+        return
+    try:
+        max_pain = float(max_pain); spot = float(spot)
+    except Exception:
+        return
+    if max_pain <= 0 or spot <= 0:
+        return
+    exp = expiry.strftime("%Y-%m-%d") if hasattr(expiry, "strftime") else str(expiry)
+    today = datetime.now().strftime("%Y-%m-%d")
+    h = load_magnet_history()
+    lst = h.get(ticker, [])
+    for e in lst:
+        if e.get("date") == today:
+            e["spot"] = spot; e["max_pain"] = max_pain; e["expiry"] = exp
+            break
+    else:
+        lst.append({"date": today, "spot": spot, "max_pain": max_pain, "expiry": exp})
+    h[ticker] = lst[-MAGNET_HISTORY_CAP:]
+    save_magnet_history(h)
+
 def _skew_history_obs(ticker):
     lst = load_skew_history().get(ticker, [])
     cutoff = datetime.now().date() - timedelta(days=SKEW_HISTORY_WINDOW_DAYS)
@@ -2444,6 +2495,7 @@ if not st.session_state.initial_scan_done or re_scan:
                 record_iv(ticker, atm_iv)     # full-watchlist daily IV logging (main thread — no file race)
                 record_skew(ticker, skew)     # full-watchlist daily skew logging (main thread)
                 if max_pain and current_price:
+                    record_magnet(ticker, max_pain, current_price, expiry)   # forward-test log (no lookahead)
                     distance_pct = ((current_price - max_pain) / max_pain) * 100
                     signal_strength = "STRONG" if abs(distance_pct) < 2 else ("MODERATE" if abs(distance_pct) < 4 else "WEAK")
                     oi_conf = get_oi_tier(total_oi)

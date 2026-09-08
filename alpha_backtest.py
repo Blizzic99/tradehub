@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import math
+import json
 import types
 import tempfile
 import importlib.util
@@ -865,6 +866,186 @@ def report(trades, baseline_tickers, start_date, end_date):
 
 
 # ==================================================================================
+# MAGNET-PIN FORWARD TEST — evaluate the pins logged by alpha_scanner.record_magnet
+# ==================================================================================
+def _fetch_daily_closes(ticker, start_date, end_date, throttle_seconds=12, timeout=30):
+    """Polygon DAILY closes over [start_date, end_date] inclusive -> {date: close}. One page (a year
+    of daily bars is far under the 50000 limit). Shares the global _poly_throttle; retries on 429.
+    Uses the UTC date of each bar (Polygon stamps daily bars at 00:00, so the UTC date == trading
+    date; converting to ET could shift it back a day). Raises if no API key."""
+    key = _polygon_key()
+    if not key:
+        raise RuntimeError("No Polygon API key. Set POLYGON_API_KEY in the environment, or add "
+                           "POLYGON_KEY to your Streamlit secrets (.streamlit/secrets.toml).")
+    frm = start_date if isinstance(start_date, str) else start_date.strftime("%Y-%m-%d")
+    to = end_date if isinstance(end_date, str) else end_date.strftime("%Y-%m-%d")
+    url = POLYGON_BASE_URL + "/v2/aggs/ticker/" + ticker + "/range/1/day/" + frm + "/" + to
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": key}
+    retries = 0
+    while True:
+        _poly_throttle(throttle_seconds)
+        resp = requests.get(url, params=params, timeout=timeout)
+        if resp.status_code == 429:
+            retries += 1
+            if retries > 4:
+                raise RuntimeError("Polygon rate limit (429) persisted for %s daily %s..%s" % (ticker, frm, to))
+            time.sleep(30 * retries)
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError("Polygon daily request failed (%s) for %s %s..%s: %s"
+                               % (resp.status_code, ticker, frm, to, resp.text[:200]))
+        break
+    out = {}
+    for b in (resp.json().get("results", []) or []):
+        d = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date()
+        out[d] = float(b["c"])
+    return out
+
+
+def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=12, verbose=True):
+    """Evaluate the magnet-pin forward test logged by alpha_scanner.record_magnet. STRICTLY no
+    lookahead: a logged prediction (date, spot, max_pain, expiry) is scored ONLY once its expiry has
+    passed, against the underlying's close AT that expiry. Prints the same column layout as the
+    ORB/VWAP report (as a convergence trade: long if spot<pin, short if spot>pin) plus a convergence
+    block. Measures the UNDERLYING's move toward the pin, NOT option P&L (no theta/spread modeled)."""
+    if not os.path.exists(history_path):
+        print("No %s yet -- run the scanner (Magnet tab) at least once to start logging predictions." % history_path)
+        return []
+    with open(history_path) as f:
+        hist = json.load(f)
+    today = date.today()
+
+    per_ticker, pending, total_logged, earliest_pending = {}, 0, 0, None
+    for tk, entries in hist.items():
+        for e in entries or []:
+            total_logged += 1
+            try:
+                exp = datetime.strptime(e["expiry"], "%Y-%m-%d").date()
+                spot, mp = float(e["spot"]), float(e["max_pain"])
+                ldate = datetime.strptime(e["date"], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if exp >= today:                       # expiry not passed -> can't score without lookahead
+                pending += 1
+                earliest_pending = exp if earliest_pending is None else min(earliest_pending, exp)
+                continue
+            per_ticker.setdefault(tk, []).append({"ldate": ldate, "spot": spot, "mp": mp, "exp": exp})
+
+    n_eval = sum(len(v) for v in per_ticker.values())
+    print("\n" + "=" * 96)
+    print("MAGNET-PIN FORWARD TEST  (as of %s)" % today)
+    print("=" * 96)
+    print("Logged snapshots: %d across %d ticker(s). Evaluable now (expiry passed): %d | still pending: %d."
+          % (total_logged, len(hist), n_eval, pending))
+    if n_eval == 0:
+        if earliest_pending:
+            print("No prediction's expiry has passed yet -- earliest pending expiry is %s. Check back after it."
+                  % earliest_pending)
+        else:
+            print("Nothing logged yet -- run the scanner a few times, then re-run this after an expiry passes.")
+        print("=" * 96)
+        return []
+
+    trades = []
+    for tk, preds in per_ticker.items():
+        lo = min(p["ldate"] for p in preds)
+        hi = max(p["exp"] for p in preds)
+        try:
+            closes = _fetch_daily_closes(tk, lo - timedelta(days=5), hi + timedelta(days=1),
+                                         throttle_seconds=throttle_seconds)
+        except Exception as ex:
+            if verbose:
+                print("  (daily fetch failed for %s: %s)" % (tk, str(ex)[:90]))
+            continue
+        if not closes:
+            continue
+        sdays = sorted(closes.keys())
+        for p in preds:
+            prior = [x for x in sdays if x <= p["exp"]]     # nearest trading-day close <= expiry
+            if not prior:
+                continue
+            cexp = closes[prior[-1]]
+            if p["spot"] <= 0 or p["mp"] <= 0:
+                continue
+            long_ret = (cexp - p["spot"]) / p["spot"] * 100.0        # baseline: long over the horizon
+            if p["spot"] < p["mp"]:
+                ret, direction = long_ret, "UP"                      # spot below pin -> predict UP (long)
+            elif p["spot"] > p["mp"]:
+                ret, direction = -long_ret, "DOWN"                   # spot above pin -> predict DOWN (short)
+            else:
+                continue
+            init_dist = abs(p["spot"] - p["mp"]) / p["mp"] * 100.0
+            final_dist = abs(cexp - p["mp"]) / p["mp"] * 100.0
+            trades.append({"return_pct": ret, "base_ret": long_ret, "direction": direction,
+                           "date": p["ldate"].isoformat(),
+                           "init_dist": init_dist, "final_dist": final_dist,
+                           "converged": final_dist < init_dist,
+                           "gap_closed": ((init_dist - final_dist) / init_dist) if init_dist > 0 else 0.0})
+
+    if not trades:
+        print("No evaluable predictions after fetching outcomes (all daily fetches failed?).")
+        print("=" * 96)
+        return []
+
+    baseline = sum(t["base_ret"] for t in trades) / len(trades)
+
+    def _stats(rows):
+        r = [t["return_pct"] for t in rows]
+        if not r:
+            return None
+        wins = [x for x in r if x > 0]; losses = [x for x in r if x < 0]
+        gw, gl = sum(wins), abs(sum(losses))
+        pf = (gw / gl) if gl > 0 else (float("inf") if gw > 0 else 0.0)
+        eq = peak = mdd = 0.0
+        for t in sorted(rows, key=lambda t: t["date"]):
+            eq += t["return_pct"]; peak = max(peak, eq); mdd = max(mdd, peak - eq)
+        return {"n": len(r), "win_rate": 100.0 * len(wins) / len(r),
+                "avg_win": (sum(wins) / len(wins)) if wins else None,
+                "avg_loss": (sum(losses) / len(losses)) if losses else None,
+                "expectancy": sum(r) / len(r), "pf": pf, "mdd": mdd}
+
+    print("BASELINE (no signal): %+.4f%% -- avg LONG move over the same horizons (%d prediction(s))."
+          % (baseline, len(trades)))
+    print("A pin only has edge if its expectancy is CLEARLY above this.\n")
+    hdr = "  %-9s %5s %6s %9s %9s %9s %9s %7s %10s" % (
+        "SIG", "N", "WIN%", "AVG WIN", "AVG LOSS", "EXPECT", "vs BASE", "PF", "MAXDD(pp)")
+    print(hdr); print("  " + "-" * (len(hdr) - 2))
+    for label, rows in (("MAGNET-UP", [t for t in trades if t["direction"] == "UP"]),
+                        ("MAGNET-DN", [t for t in trades if t["direction"] == "DOWN"]),
+                        ("ALL", trades)):
+        s = _stats(rows)
+        if s is None:
+            print("  %-9s %5d   -- none --" % (label, 0)); continue
+        vsbase = round(s["expectancy"] - baseline, 4) + 0.0
+        warn = "   ** n<30: treat as noise **" if s["n"] < 30 else ""
+        print("  %-9s %5d %6.1f %9s %9s %+9.4f %9s %7s %10.2f%s" % (
+            label, s["n"], s["win_rate"],
+            ("%+.3f" % s["avg_win"]) if s["avg_win"] is not None else "n/a",
+            ("%+.3f" % s["avg_loss"]) if s["avg_loss"] is not None else "n/a",
+            round(s["expectancy"], 4) + 0.0, "%+.4f" % vsbase,
+            ("inf" if s["pf"] == float("inf") else "%.2f" % s["pf"]), s["mdd"], warn))
+
+    pct_conv = 100.0 * sum(1 for t in trades if t["converged"]) / len(trades)
+    avg_init = sum(t["init_dist"] for t in trades) / len(trades)
+    avg_final = sum(t["final_dist"] for t in trades) / len(trades)
+    avg_gap = 100.0 * sum(t["gap_closed"] for t in trades) / len(trades)
+    print("\n  CONVERGENCE (distance to pin, %d prediction(s)):" % len(trades))
+    print("    ended CLOSER to the pin : %.1f%%" % pct_conv)
+    print("    avg distance at log     : %.2f%%" % avg_init)
+    print("    avg distance at expiry  : %.2f%%" % avg_final)
+    print("    avg gap closed          : %+.1f%%  (100%% = landed exactly on the pin; negative = moved away)" % avg_gap)
+
+    print("\n  Notes:")
+    print("  - Measures the UNDERLYING's move toward the pin, NOT option P&L. Real option P&L would be")
+    print("    WORSE: theta decay + bid/ask spread are not modeled.")
+    print("  - Predictions are DAILY snapshots, so entries targeting the same expiry are correlated")
+    print("    (not independent) -- N is optimistic for statistical significance.")
+    print("  - No lookahead: each prediction is scored only after its expiry, vs the close at expiry.")
+    print("=" * 96)
+    return trades
+
+
+# ==================================================================================
 # TRAIN-WINDOW PARAMETER SWEEP — compare threshold variations on TRAIN data only
 # ==================================================================================
 SWEEP_PARAMS = ("vol_confirm", "orb_min_range_pct", "orb_break_buffer_frac", "vwap_max_vix")
@@ -958,7 +1139,14 @@ if __name__ == "__main__":
                          "runs so the canonical backtest_trades.csv is never clobbered.")
     ap.add_argument("--throttle", type=int, default=12,
                     help="Per-page throttle seconds used only for the pre-run time estimate (fetcher default is 12).")
+    ap.add_argument("--magnet-report", action="store_true",
+                    help="Instead of the ORB/VWAP backtest, evaluate the magnet-pin forward test "
+                         "(magnet_history.json logged by the scanner) — convergence to the pin by expiry.")
     args = ap.parse_args()
+
+    if args.magnet_report:
+        magnet_forward_report()
+        raise SystemExit(0)
 
     today = datetime.now(ET_ZONE).date()
     end_date = datetime.strptime(args.end, "%Y-%m-%d").date() if args.end else (today - timedelta(days=1))
