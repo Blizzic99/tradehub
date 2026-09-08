@@ -45,5 +45,5 @@ desktop.ini
 # Logs
 *.log
 
-# Backtest output (generated)
-backtest_trades.csv
+# Backtest output (generated) — canonical run + all comparison/variant runs
+backtest_*.csv
