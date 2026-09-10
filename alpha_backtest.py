@@ -902,7 +902,8 @@ def _fetch_daily_closes(ticker, start_date, end_date, throttle_seconds=12, timeo
     return out
 
 
-def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=12, verbose=True):
+def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=12, verbose=True,
+                          csv_out=None):
     """Evaluate the magnet-pin forward test logged by alpha_scanner.record_magnet. STRICTLY no
     lookahead: a logged prediction (date, spot, max_pain, expiry) is scored ONLY once its expiry has
     passed, against the underlying's close AT that expiry. Prints the same column layout as the
@@ -977,7 +978,7 @@ def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=1
             init_dist = abs(p["spot"] - p["mp"]) / p["mp"] * 100.0
             final_dist = abs(cexp - p["mp"]) / p["mp"] * 100.0
             trades.append({"return_pct": ret, "base_ret": long_ret, "direction": direction,
-                           "date": p["ldate"].isoformat(),
+                           "date": p["ldate"].isoformat(), "hold_days": (p["exp"] - p["ldate"]).days,
                            "init_dist": init_dist, "final_dist": final_dist,
                            "converged": final_dist < init_dist,
                            "gap_closed": ((init_dist - final_dist) / init_dist) if init_dist > 0 else 0.0})
@@ -1042,7 +1043,116 @@ def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=1
     print("    (not independent) -- N is optimistic for statistical significance.")
     print("  - No lookahead: each prediction is scored only after its expiry, vs the close at expiry.")
     print("=" * 96)
+    if csv_out:
+        cols = ["date", "direction", "hold_days", "return_pct", "base_ret",
+                "init_dist", "final_dist", "converged", "gap_closed"]
+        try:
+            with open(csv_out, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=cols)
+                w.writeheader()
+                for t in trades:
+                    w.writerow({k: t.get(k) for k in cols})
+            print("Wrote %d convergence row(s) to %s  (feed to --cost-check)." % (len(trades), csv_out))
+        except Exception as e:
+            print("  (could not write %s: %s)" % (csv_out, str(e)[:80]))
     return trades
+
+
+# ==================================================================================
+# OPTION-COST STRESS TEST — does an underlying edge survive spread + theta?
+# ==================================================================================
+def cost_check(csv_path, signal_type=None, iv=0.30, hold_days_override=None, verbose=True):
+    """Rough option-cost stress test for ANY signal's trade CSV (ORB, VWAP, or magnet convergence).
+    Reads the per-trade SIGNED underlying return (`return_pct` column) and models buying an ATM
+    option (delta 0.5, given `iv`): gross option return = leverage x underlying move; NET subtracts a
+    round-trip bid/ask SPREAD and THETA (scaled by each trade's real hold). Prints NET expectancy and
+    NET win% across a DTE x spread grid, plus the break-even underlying edge. This is a rough SANITY
+    check, NOT precise option P&L (delta-only, ATM, one IV) -- but the grid brackets realistic costs.
+
+    Generic across signal shapes:
+      * `signal_type` filters a mixed CSV (e.g. "ORB" / "VWAP"); None = all rows.
+      * Hold duration for theta is auto-detected per row: `bars_held` (intraday MINUTES -> /390 of a
+        trading day) or `hold_days` (already in trading days, e.g. magnet convergence). If neither is
+        present, uses `hold_days_override` or assumes 1.0 day.
+    """
+    if not os.path.exists(csv_path):
+        print("No such CSV: %s" % csv_path)
+        return
+    import csv as _csv
+    with open(csv_path) as f:
+        rows = list(_csv.DictReader(f))
+    if signal_type:
+        rows = [r for r in rows if str(r.get("signal_type", "")).upper() == signal_type.upper()]
+    data = []
+    for r in rows:
+        try:
+            data.append((r, float(r["return_pct"])))
+        except Exception:
+            pass
+    if not data:
+        print("No usable rows (need a numeric 'return_pct' column) in %s%s."
+              % (csv_path, " for signal " + signal_type if signal_type else ""))
+        return
+
+    def hold_frac(r):
+        if hold_days_override is not None:
+            return float(hold_days_override)
+        v = r.get("bars_held")
+        if v not in (None, ""):
+            try:
+                return float(v) / 390.0                 # intraday minutes -> fraction of a trading day
+            except Exception:
+                pass
+        v = r.get("hold_days")
+        if v not in (None, ""):
+            try:
+                return float(v)                          # already trading days (e.g. magnet)
+            except Exception:
+                pass
+        return 1.0                                       # unknown hold -> assume a full day
+
+    n = len(data)
+    rets = [x for _, x in data]
+    raw_exp = sum(rets) / n
+    wins = sum(1 for x in rets if x > 0)
+    avg_hold = sum(hold_frac(r) for r, _ in data) / n
+
+    def lev(dte):
+        return 0.5 / (0.4 * iv * math.sqrt(dte / 252.0))   # ATM: L = delta / (premium/S); S cancels
+    def theta_daily(dte):
+        return 0.5 / dte                                   # ATM daily theta ~ 0.5/DTE of premium
+
+    print("=" * 92)
+    print("OPTION-COST STRESS TEST  |  %s%s  |  n=%d"
+          % (os.path.basename(csv_path), "  signal=" + signal_type.upper() if signal_type else "", n))
+    print("=" * 92)
+    print("Raw UNDERLYING expectancy : %+.4f%%/trade   (win%% %.1f  |  avg hold %.2f trading day(s))"
+          % (raw_exp, 100.0 * wins / n, avg_hold))
+    print("Modeled as buying an ATM option (delta 0.5, IV %.0f%%). Values below are %% of premium/trade."
+          % (iv * 100))
+    print("Gross = leverage x underlying move; NET subtracts round-trip SPREAD + THETA (theta scaled by")
+    print("each trade's real hold). Delta-only (ignores gamma). NOT precise option P&L.\n")
+    print("  %-26s %7s %9s %11s %9s" % ("SCENARIO", "LEVER", "GROSS", "NET EXP", "NET WIN%"))
+    print("  " + "-" * 66)
+    for dte, lbl in [(2, "0-2 DTE (weekly/0DTE)"), (7, "~weekly (7 DTE)"), (30, "~monthly (30 DTE)")]:
+        L, td = lev(dte), theta_daily(dte)
+        gross_exp = 100.0 * (L * raw_exp / 100.0)
+        for sp, spl in [(0.02, "2%"), (0.05, "5%"), (0.10, "10%")]:
+            nets = [L * (x / 100.0) - (sp + td * hold_frac(r)) for r, x in data]
+            exp = 100.0 * sum(nets) / n
+            w = 100.0 * sum(1 for v in nets if v > 0) / n
+            print("  %-26s %6.0fx %+8.2f%% %+10.2f%% %8.1f%%" % (lbl + " | sp " + spl, L, gross_exp, exp, w))
+
+    Lw = lev(7)
+    be = 0.05 / Lw * 100.0
+    print("\n  Break-even: at 7 DTE (%.0fx) you'd need a raw underlying edge >= %.3f%%/trade to cover a 5%%"
+          % (Lw, be))
+    print("  round-trip spread ALONE (pre-theta). This signal delivers %+.4f%%." % raw_exp)
+    print("\n  CAVEATS: delta-only (ignores gamma, which slightly helps long-option winners); assumes ATM,")
+    print("  IV %.0f%%, buy-at-ask / sell-at-bid; ignores commissions & slippage beyond the spread. A rough"
+          % (iv * 100))
+    print("  sanity check -- real results vary with strike / IV / execution.")
+    print("=" * 92)
 
 
 # ==================================================================================
@@ -1142,10 +1252,24 @@ if __name__ == "__main__":
     ap.add_argument("--magnet-report", action="store_true",
                     help="Instead of the ORB/VWAP backtest, evaluate the magnet-pin forward test "
                          "(magnet_history.json logged by the scanner) — convergence to the pin by expiry.")
+    ap.add_argument("--magnet-csv", default=None,
+                    help="With --magnet-report, also write the convergence rows to this CSV (feed to --cost-check).")
+    ap.add_argument("--cost-check", default=None, metavar="CSV",
+                    help="Instead of a backtest, run the option-cost stress test on any trade CSV "
+                         "(ORB/VWAP/magnet): net expectancy + win%% after spread + theta, across a DTE x "
+                         "spread grid. Combine with --signal to filter and --iv to set the vol assumption.")
+    ap.add_argument("--signal", default=None,
+                    help="With --cost-check, filter to one signal_type (e.g. ORB or VWAP).")
+    ap.add_argument("--iv", type=float, default=0.30,
+                    help="With --cost-check, the assumed ATM implied vol (default 0.30).")
     args = ap.parse_args()
 
+    if args.cost_check:
+        cost_check(args.cost_check, signal_type=args.signal, iv=args.iv)
+        raise SystemExit(0)
+
     if args.magnet_report:
-        magnet_forward_report()
+        magnet_forward_report(csv_out=args.magnet_csv)
         raise SystemExit(0)
 
     today = datetime.now(ET_ZONE).date()
