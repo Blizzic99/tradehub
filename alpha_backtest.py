@@ -903,12 +903,15 @@ def _fetch_daily_closes(ticker, start_date, end_date, throttle_seconds=12, timeo
 
 
 def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=12, verbose=True,
-                          csv_out=None):
+                          csv_out=None, max_distance_pct=1.0):
     """Evaluate the magnet-pin forward test logged by alpha_scanner.record_magnet. STRICTLY no
     lookahead: a logged prediction (date, spot, max_pain, expiry) is scored ONLY once its expiry has
     passed, against the underlying's close AT that expiry. Prints the same column layout as the
     ORB/VWAP report (as a convergence trade: long if spot<pin, short if spot>pin) plus a convergence
-    block. Measures the UNDERLYING's move toward the pin, NOT option P&L (no theta/spread modeled)."""
+    block. Measures the UNDERLYING's move toward the pin, NOT option P&L (no theta/spread modeled).
+
+    `max_distance_pct` filters to predictions whose spot was within that %% of the pin AT LOG TIME
+    (default 1.0 = the real entry criterion; None or a large value scores every logged prediction)."""
     if not os.path.exists(history_path):
         print("No %s yet -- run the scanner (Magnet tab) at least once to start logging predictions." % history_path)
         return []
@@ -917,6 +920,7 @@ def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=1
     today = date.today()
 
     per_ticker, pending, total_logged, earliest_pending = {}, 0, 0, None
+    n_eval_total = 0                                    # expiry passed, BEFORE the distance filter
     for tk, entries in hist.items():
         for e in entries or []:
             total_logged += 1
@@ -930,16 +934,27 @@ def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=1
                 pending += 1
                 earliest_pending = exp if earliest_pending is None else min(earliest_pending, exp)
                 continue
+            n_eval_total += 1
+            if mp <= 0:
+                continue
+            dist = abs(spot - mp) / mp * 100.0     # distance from the pin AT LOG TIME
+            if max_distance_pct is not None and dist > max_distance_pct:
+                continue                            # doesn't match the real entry criterion -> skip
             per_ticker.setdefault(tk, []).append({"ldate": ldate, "spot": spot, "mp": mp, "exp": exp})
 
     n_eval = sum(len(v) for v in per_ticker.values())
+    filt = ("<=%.2f%% from pin at log" % max_distance_pct) if max_distance_pct is not None else "no distance filter"
     print("\n" + "=" * 96)
-    print("MAGNET-PIN FORWARD TEST  (as of %s)" % today)
+    print("MAGNET-PIN FORWARD TEST  (as of %s)   [entry filter: %s]" % (today, filt))
     print("=" * 96)
-    print("Logged snapshots: %d across %d ticker(s). Evaluable now (expiry passed): %d | still pending: %d."
-          % (total_logged, len(hist), n_eval, pending))
+    print("Logged snapshots: %d across %d ticker(s). Expiry passed: %d | matching filter: %d | pending: %d."
+          % (total_logged, len(hist), n_eval_total, n_eval, pending))
     if n_eval == 0:
-        if earliest_pending:
+        if n_eval_total > 0:
+            print("None of the %d expiry-passed prediction(s) were within %.2f%% of the pin at log time."
+                  % (n_eval_total, max_distance_pct))
+            print("Loosen it with --max-distance (e.g. --max-distance 100 to score all), or wait for closer setups.")
+        elif earliest_pending:
             print("No prediction's expiry has passed yet -- earliest pending expiry is %s. Check back after it."
                   % earliest_pending)
         else:
@@ -1254,6 +1269,9 @@ if __name__ == "__main__":
                          "(magnet_history.json logged by the scanner) — convergence to the pin by expiry.")
     ap.add_argument("--magnet-csv", default=None,
                     help="With --magnet-report, also write the convergence rows to this CSV (feed to --cost-check).")
+    ap.add_argument("--max-distance", type=float, default=1.0,
+                    help="With --magnet-report, only score predictions within this %% of the pin at LOG "
+                         "time (default 1.0 = your real entry criterion; use e.g. 100 to score all).")
     ap.add_argument("--cost-check", default=None, metavar="CSV",
                     help="Instead of a backtest, run the option-cost stress test on any trade CSV "
                          "(ORB/VWAP/magnet): net expectancy + win%% after spread + theta, across a DTE x "
@@ -1269,7 +1287,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if args.magnet_report:
-        magnet_forward_report(csv_out=args.magnet_csv)
+        magnet_forward_report(csv_out=args.magnet_csv, max_distance_pct=args.max_distance)
         raise SystemExit(0)
 
     today = datetime.now(ET_ZONE).date()
