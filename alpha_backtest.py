@@ -1074,6 +1074,82 @@ def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=1
 
 
 # ==================================================================================
+# MAGNET PIPELINE / ACCRUAL — how fast are in-band predictions landing? (fetch-free)
+# ==================================================================================
+def magnet_pipeline_report(history_path="magnet_history.json", max_distance_pct=1.0,
+                           target_n=30, recent_days=14):
+    """FETCH-FREE view of how fast in-band magnet predictions are accruing, so you can estimate when
+    the forward test will reach a usable sample -- WITHOUT waiting expiry-by-expiry. Whether a
+    prediction is 'in band' (spot within max_distance_pct of the pin) is a LOG-TIME fact, known the
+    instant it's logged, so this needs no outcome data and no Polygon calls. Reports recent daily
+    in-band counts, the average rate, distinct (ticker,expiry) setups, current evaluable-in-band n,
+    and a rough projection to target_n (with the daily-snapshot correlation caveat)."""
+    if not os.path.exists(history_path):
+        print("No %s yet -- run the scanner to start logging." % history_path)
+        return
+    with open(history_path) as f:
+        hist = json.load(f)
+    today = date.today()
+    by_day = {}          # 'YYYY-MM-DD' -> [total_logged, in_band]
+    setups = set()       # distinct (ticker, expiry) that were ever in band
+    total_in_band = evaluable_in_band = 0
+    for tk, entries in hist.items():
+        for e in entries or []:
+            try:
+                spot = float(e["spot"]); mp = float(e["max_pain"]); ds = e["date"]
+                exp = datetime.strptime(e["expiry"], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if mp <= 0:
+                continue
+            slot = by_day.setdefault(ds, [0, 0]); slot[0] += 1
+            if abs(spot - mp) / mp * 100.0 <= max_distance_pct:
+                slot[1] += 1
+                total_in_band += 1
+                setups.add((tk, e["expiry"]))
+                if exp < today:
+                    evaluable_in_band += 1
+    if not by_day:
+        print("No usable logged predictions yet.")
+        return
+    days = sorted(by_day)
+    n_days = len(days)
+    rate = total_in_band / n_days
+
+    print("=" * 92)
+    print("MAGNET PIPELINE / ACCRUAL  (as of %s)   [band: <=%.2f%% from pin at log]"
+          % (today, max_distance_pct))
+    print("=" * 92)
+    print("Scan-days logged: %d  (%s .. %s).   In-band predictions logged so far: %d."
+          % (n_days, days[0], days[-1], total_in_band))
+    print("\nRecent scan-days (in band / total logged):")
+    for ds in days[-recent_days:]:
+        tot, ib = by_day[ds]
+        print("  %s :  %2d in band / %d logged" % (ds, ib, tot))
+    print("\nAverage: %.1f in-band prediction(s) per scan-day." % rate)
+    print("Distinct (ticker, expiry) setups in band so far : %d" % len(setups))
+    print("Currently EVALUABLE in band (expiry passed)     : %d   (target n=%d)" % (evaluable_in_band, target_n))
+
+    remaining = target_n - evaluable_in_band
+    if remaining <= 0:
+        print("\n>> Target of %d evaluable in-band predictions already reached." % target_n)
+    elif rate > 0:
+        d_need = remaining / rate
+        print("\nProjection (RAW daily snapshots): at ~%.1f in-band/scan-day, ~%.0f more scan-day(s)"
+              % (rate, d_need))
+        print("  (~%.1f weeks if you run the scanner every trading day) to reach %d, plus a few days'"
+              % (d_need / 5.0, target_n))
+        print("  lag for the newest predictions' expiries to pass before they become scorable.")
+    print("\n  IMPORTANT: daily snapshots are CORRELATED -- the same ticker sitting near its pin for")
+    print("  several days is ONE setup logged repeatedly. Distinct (ticker,expiry) setups (%d so far)"
+          % len(setups))
+    print("  accrue much slower and are the more honest 'independent sample': 30 raw snapshots is NOT")
+    print("  30 independent trades, so treat the raw projection as a floor on time-to-significance.")
+    print("  (Convergence uses underlying moves, not option P&L -- run --cost-check for that.)")
+    print("=" * 92)
+
+
+# ==================================================================================
 # OPTION-COST STRESS TEST — does an underlying edge survive spread + theta?
 # ==================================================================================
 def cost_check(csv_path, signal_type=None, iv=0.30, hold_days_override=None, verbose=True):
@@ -1270,8 +1346,14 @@ if __name__ == "__main__":
     ap.add_argument("--magnet-csv", default=None,
                     help="With --magnet-report, also write the convergence rows to this CSV (feed to --cost-check).")
     ap.add_argument("--max-distance", type=float, default=1.0,
-                    help="With --magnet-report, only score predictions within this %% of the pin at LOG "
-                         "time (default 1.0 = your real entry criterion; use e.g. 100 to score all).")
+                    help="With --magnet-report / --magnet-pipeline, the in-band threshold: only count "
+                         "predictions within this %% of the pin at LOG time (default 1.0 = your real "
+                         "entry criterion; use e.g. 100 to include all).")
+    ap.add_argument("--magnet-pipeline", action="store_true",
+                    help="Fetch-free accrual view: how many in-band (<=--max-distance) magnet predictions "
+                         "are landing per scan-day + a rough projection to --target-n. No Polygon calls.")
+    ap.add_argument("--target-n", type=int, default=30,
+                    help="With --magnet-pipeline, the evaluable sample size to project toward (default 30).")
     ap.add_argument("--cost-check", default=None, metavar="CSV",
                     help="Instead of a backtest, run the option-cost stress test on any trade CSV "
                          "(ORB/VWAP/magnet): net expectancy + win%% after spread + theta, across a DTE x "
@@ -1281,6 +1363,10 @@ if __name__ == "__main__":
     ap.add_argument("--iv", type=float, default=0.30,
                     help="With --cost-check, the assumed ATM implied vol (default 0.30).")
     args = ap.parse_args()
+
+    if args.magnet_pipeline:
+        magnet_pipeline_report(max_distance_pct=args.max_distance, target_n=args.target_n)
+        raise SystemExit(0)
 
     if args.cost_check:
         cost_check(args.cost_check, signal_type=args.signal, iv=args.iv)
