@@ -477,7 +477,7 @@ def detect_orb_entry(session_df, vol_confirm=None, min_range_pct=None, break_buf
 # ==================================================================================
 # TRADE SIMULATOR (historical replay) — turn a detector fire into a completed trade
 # ==================================================================================
-def simulate_trade(session_df, vwap_series, entry_pos, signal_type, direction, ticker="SPY"):
+def simulate_trade(session_df, vwap_series, entry_pos, signal_type, direction, ticker="SPY", stop_pct=None):
     """Simulate ONE trade from a detector fire to its exit — forward-only, no lookahead.
 
     Required signature is (session_df, vwap_series, entry_pos, signal_type, direction); `ticker`
@@ -538,14 +538,27 @@ def simulate_trade(session_df, vwap_series, entry_pos, signal_type, direction, t
                 return c >= or_low                        # short breakdown closed back inside the range
         return False
 
+    # Optional stop-loss (opt-in via stop_pct; None/0 = off = original behavior). Close-through
+    # trigger: a bar that CLOSES beyond the stop level exits the trade, filled AT the stop level.
+    # Checked alongside the thesis exit; whichever fires first wins, stop takes priority on a tie.
+    stop_level = None
+    if stop_pct is not None and stop_pct > 0:
+        stop_level = entry_price * (1 - stop_pct) if is_long else entry_price * (1 + stop_pct)
+
     # Forward-only exit scan: bars fill_pos..end, all strictly after the signal bar (no lookahead).
     exit_pos = n - 1                                      # default: session's final real close
+    exit_reason = "session_close"
+    stop_fill = None
     for i in range(fill_pos, n):
+        c = float(df["close"].iloc[i])
+        if stop_level is not None and ((is_long and c <= stop_level) or (not is_long and c >= stop_level)):
+            exit_pos, exit_reason, stop_fill = i, "stop", stop_level     # fill AT the stop, not the (worse) close
+            break
         if _exit_triggered(i):
-            exit_pos = i
+            exit_pos, exit_reason = i, "thesis"
             break
 
-    exit_price = float(df["close"].iloc[exit_pos])
+    exit_price = stop_fill if stop_fill is not None else float(df["close"].iloc[exit_pos])
     exit_time = df.index[exit_pos]
 
     # return_pct = signed UNDERLYING price move, in percent. NOT option P&L — a real options position
@@ -566,6 +579,7 @@ def simulate_trade(session_df, vwap_series, entry_pos, signal_type, direction, t
         "exit_price": round(exit_price, 2),
         "return_pct": round(return_pct, 3),
         "bars_held": exit_pos - fill_pos + 1,            # inclusive: fill bar through exit bar
+        "exit_reason": exit_reason,                       # stop / thesis / session_close
     }
 
 
@@ -573,7 +587,7 @@ def simulate_trade(session_df, vwap_series, entry_pos, signal_type, direction, t
 # FULL BACKTEST DRIVER — fetch, session-split, detect, and simulate across many tickers
 # ==================================================================================
 TRADE_FIELDS = ["ticker", "date", "signal_type", "direction", "entry_time",
-                "entry_price", "exit_time", "exit_price", "return_pct", "bars_held"]
+                "entry_price", "exit_time", "exit_price", "return_pct", "bars_held", "exit_reason"]
 
 
 def _load_real_yfinance():
@@ -652,7 +666,7 @@ def _session_oc_returns(sessions):
 def run_backtest(tickers, start_date, end_date, apply_vix_gate=True,
                  vol_confirm=None, orb_min_range_pct=None, orb_break_buffer_frac=None,
                  vwap_max_vix=None, write_csv=True, verbose=True,
-                 csv_path="backtest_trades.csv"):
+                 csv_path="backtest_trades.csv", stop_pct=None):
     """Backtest the VWAP-reclaim + ORB entry detectors across `tickers` over
     [start_date, end_date], simulating every fire into a completed trade.
 
@@ -729,7 +743,7 @@ def run_backtest(tickers, start_date, end_date, apply_vix_gate=True,
                 vix = prior_vix.get(d)                  # PRIOR trading day's VIX close (no lookahead)
                 gated = apply_vix_gate and isinstance(vix, (int, float)) and vix > max_vix
                 if not gated:
-                    tr = simulate_trade(s, vwap, pos, "VWAP", direction, ticker=ticker)
+                    tr = simulate_trade(s, vwap, pos, "VWAP", direction, ticker=ticker, stop_pct=stop_pct)
                     if tr:
                         tk_trades.append(tr)
             o = detect_orb_entry(s, vol_confirm=vol_confirm,          # ORB breakout -- NOT gated
@@ -737,7 +751,7 @@ def run_backtest(tickers, start_date, end_date, apply_vix_gate=True,
                                  break_buffer_frac=orb_break_buffer_frac)
             if o:
                 pos, direction = o
-                tr = simulate_trade(s, vwap, pos, "ORB", direction, ticker=ticker)
+                tr = simulate_trade(s, vwap, pos, "ORB", direction, ticker=ticker, stop_pct=stop_pct)
                 if tr:
                     tk_trades.append(tr)
         all_trades.extend(tk_trades)
@@ -1340,6 +1354,9 @@ if __name__ == "__main__":
                          "runs so the canonical backtest_trades.csv is never clobbered.")
     ap.add_argument("--throttle", type=int, default=12,
                     help="Per-page throttle seconds used only for the pre-run time estimate (fetcher default is 12).")
+    ap.add_argument("--stop-pct", type=float, default=None,
+                    help="Opt-in stop-loss as a fraction of entry (e.g. 0.005 = 0.5%%). Off by default. "
+                         "Close-through trigger, filled at the stop level; stop-or-thesis whichever fires first.")
     ap.add_argument("--magnet-report", action="store_true",
                     help="Instead of the ORB/VWAP backtest, evaluate the magnet-pin forward test "
                          "(magnet_history.json logged by the scanner) — convergence to the pin by expiry.")
@@ -1396,7 +1413,7 @@ if __name__ == "__main__":
     print("Starting pull now...\n")
 
     trades = run_backtest(tickers, start_date, end_date, apply_vix_gate=apply_gate,
-                          csv_path=args.csv)
+                          csv_path=args.csv, stop_pct=args.stop_pct)
 
     vwap_n = sum(1 for t in trades if t.get("signal_type") == "VWAP")
     orb_n = sum(1 for t in trades if t.get("signal_type") == "ORB")
