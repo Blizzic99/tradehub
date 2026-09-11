@@ -1152,8 +1152,12 @@ def get_market_bias(context):
 # yields "N/A" rather than breaking a scan.
 # ============================================================
 RISK_FREE_RATE = 0.045       # annual risk-free rate (per spec)
-STOP_BUFFER = 0.0075         # 0.75% stop offset from the breakout / magnet level
+STOP_BUFFER = 0.0075         # FALLBACK flat stop offset (used only when IV/DTE unavailable)
 MAGNET_TARGET_OFFSET = 0.30  # exit ~$0.30 before the max-pain pin ($0.20-$0.50 band)
+# DTE-aware stop/target sizing: distances scale with the option's expected 1-sigma move,
+# E = price * ATM_IV * sqrt(DTE_years). A 2DTE trade gets a tight stop/target; a 30DTE a wide one.
+STOP_K = 0.5                 # stop at 0.5 x expected move (adverse)
+TARGET_K = 1.0               # target at 1.0 x expected move (favorable)
 _NORM = NormalDist()
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1678,28 +1682,48 @@ def _fmt_strike(s):
     return "$" + (str(int(s)) if float(s).is_integer() else str(round(s, 2)))
 
 def compute_trade_mechanics(ticker, price, is_long, signal_type, level, magnet_strike=None):
-    """Phase-1 computed columns for one signal. Returns display strings plus a
-    couple of private fields (_iv, _sugg_strike) that Phase 3 reuses. Never raises."""
+    """Phase-1 computed columns for one signal. Stop/target are DTE-AWARE: sized to the option's
+    expected 1-sigma move E = price * ATM_IV * sqrt(DTE_years) -- stop at STOP_K*E (adverse), target
+    at TARGET_K*E (favorable) -- so a 2DTE trade gets a tight stop/target and a 30DTE a wide one,
+    instead of a flat %. Magnet targets the pin and flags '>1sigma' when the pin is more than one
+    expected move away (unlikely to be reached by expiry). Falls back to the flat STOP_BUFFER when
+    IV/DTE are unavailable. Returns display strings + private fields (_iv/_sugg_strike/_atm_iv).
+    Never raises."""
     out = {"Suggested Strike": "N/A", "Est. Delta": "N/A",
            "Stop Price": "N/A", "Profit Target": "N/A",
            "_iv": None, "_sugg_strike": None, "_atm_iv": None}
     try:
+        snap = get_option_chain_snapshot(ticker)
+        atm_iv = _atm_iv(snap, price) if snap else None
+        dte_years = snap.get("dte_years") if snap else None
+        # Expected 1-sigma underlying move ($) over the option's life; None if IV/DTE unavailable.
+        E = (price * atm_iv * sqrt(dte_years)) if (atm_iv and dte_years and price and price > 0
+                                                   and dte_years > 0) else None
+
         if isinstance(level, (int, float)) and level > 0:
-            stop = level * (1 - STOP_BUFFER) if is_long else level * (1 + STOP_BUFFER)
+            if E is not None:
+                stop = level - STOP_K * E if is_long else level + STOP_K * E     # DTE-aware
+            else:
+                stop = level * (1 - STOP_BUFFER) if is_long else level * (1 + STOP_BUFFER)  # fallback
             out["Stop Price"] = "$" + str(round(stop, 2))
+
         if signal_type == "magnet" and isinstance(magnet_strike, (int, float)):
             tgt = magnet_strike - MAGNET_TARGET_OFFSET if is_long else magnet_strike + MAGNET_TARGET_OFFSET
+            far = E is not None and abs(magnet_strike - price) > E    # pin more than one expected move away
+            out["Profit Target"] = "$" + str(round(tgt, 2)) + (" (>1sd)" if far else "")   # (>1sd)=pin >1 expected move away, unlikely by expiry
+        elif isinstance(level, (int, float)) and level > 0 and E is not None:
+            tgt = level + TARGET_K * E if is_long else level - TARGET_K * E      # DTE-aware ~1σ target
             out["Profit Target"] = "$" + str(round(tgt, 2))
         else:
-            out["Profit Target"] = "Stop only"   # ORB / VWAP: momentum exits, no fixed target
-        snap = get_option_chain_snapshot(ticker)
+            out["Profit Target"] = "Stop only"   # no IV/DTE and not a magnet -> momentum exit only
+
         if snap:
             strike = _nearest_otm_strike(snap["strikes"], price, is_long)
             out["_sugg_strike"] = strike
             out["Suggested Strike"] = _fmt_strike(strike)
             iv = _iv_at(snap, strike, is_long) if strike is not None else None
             out["_iv"] = iv
-            out["_atm_iv"] = _atm_iv(snap, price)
+            out["_atm_iv"] = atm_iv
             if strike is not None and iv:
                 d = _bs_delta(price, strike, snap["dte_years"], iv, RISK_FREE_RATE, is_long)
                 if d is not None:
