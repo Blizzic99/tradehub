@@ -658,113 +658,142 @@ def get_top_option_volume_tickers(limit=50):
         return []
 
 @st.cache_data(ttl=120, show_spinner=False)
-def get_max_pain_strike(ticker):
-    """Returns (max_pain_strike, current_price, expiry_date, total_oi_at_pain, atm_iv, skew).
-    OI-at-pin, ATM IV (daily IV log) AND 25-delta skew (daily skew log) are all computed here from
-    the same chain, so none needs a second network fetch. Cached 120s so reruns are free."""
+def _spot_price(ticker):
+    """Current-ish underlying price. Polygon real-time last-trade needs a paid STOCK plan (403 on the
+    free stock tier), so fall back to yfinance's latest close (one light call via the browser session,
+    cloud-safe) and finally Polygon's prev close (EOD, entitled) as a stale-but-present backstop."""
     try:
-        stock = _yf_ticker(ticker)
-        expirations = _yf_options(stock)
-        if not expirations:
-            return None, None, None, 0, None, None
-        today = datetime.now().date()
-        exp_date = None
-        for exp_str in expirations:
-            exp_dt = datetime.strptime(exp_str, "%Y-%m-%d").date()
-            if exp_dt >= today:
-                exp_date = exp_str
+        pr = requests.get(POLYGON_BASE_URL + "/v2/last/trade/" + ticker,
+                          params={"apiKey": POLYGON_KEY}, timeout=5).json()
+        if pr.get("status") == "OK" and (pr.get("results") or {}).get("p"):
+            return float(pr["results"]["p"])
+    except Exception:
+        pass
+    try:
+        h = _yf_ticker(ticker).history(period="1d")
+        if h is not None and not h.empty:
+            return float(h["Close"].iloc[-1])
+    except Exception:
+        pass
+    try:
+        pv = requests.get(POLYGON_BASE_URL + "/v2/aggs/ticker/" + ticker + "/prev",
+                          params={"apiKey": POLYGON_KEY, "adjusted": "true"}, timeout=6).json()
+        res = pv.get("results") or []
+        if res and res[0].get("c"):
+            return float(res[0]["c"])
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _polygon_chain(ticker):
+    """Nearest-expiry option chain from POLYGON (entitled options snapshot) — the single source of
+    truth for all options analytics (max-pain, GEX, IV, P/C, skew, strike/delta). Normalized to:
+    {expiry, dte_years, spot, strikes[all], call_oi/put_oi, call_iv/put_iv, call_vol_total,
+    put_vol_total}. Paginates the snapshot; drops deep-ITM/OTM garbage IV (>=500%). Real OI + IV,
+    and unlike Yahoo it isn't blocked from datacenter IPs (fixes the cloud outage). None on failure.
+    Cached 120s so get_max_pain_strike AND get_option_chain_snapshot share ONE fetch per ticker."""
+    try:
+        if not POLYGON_KEY:
+            return None
+        today = datetime.now().date().isoformat()
+        rr = requests.get(POLYGON_BASE_URL + "/v3/reference/options/contracts",
+                          params={"apiKey": POLYGON_KEY, "underlying_ticker": ticker,
+                                  "expiration_date.gte": today, "expired": "false",
+                                  "sort": "expiration_date", "order": "asc", "limit": 1}, timeout=8)
+        exps = rr.json().get("results") or []
+        exp_str = exps[0].get("expiration_date") if exps else None
+        if not exp_str:
+            return None
+        call_iv, put_iv, call_oi, put_oi = {}, {}, {}, {}
+        call_vol = put_vol = 0.0
+        strikes = set()
+        url = POLYGON_BASE_URL + "/v3/snapshot/options/" + ticker
+        params = {"apiKey": POLYGON_KEY, "expiration_date": exp_str, "limit": 250}
+        pages = 0
+        while url and pages < 10:
+            resp = requests.get(url, params=params, timeout=15)
+            if resp.status_code != 200:
                 break
-        if exp_date is None:
-            return None, None, None, 0, None, None
-        expiry_date = datetime.strptime(exp_date, "%Y-%m-%d").date()
-        chain = stock.option_chain(exp_date)
-        calls = chain.calls
-        puts = chain.puts
-        strikes = {}
-        call_iv_map, put_iv_map = {}, {}   # for the 25-delta skew (Phase 4), same chain, no refetch
-        for _, row in calls.iterrows():
-            strike = row["strike"]
-            oi = row["openInterest"] if "openInterest" in row and not np.isnan(row["openInterest"]) else 0
-            strikes[strike] = strikes.get(strike, {"call_oi": 0, "put_oi": 0})
-            strikes[strike]["call_oi"] += int(oi)
-            try:
-                iv = float(row["impliedVolatility"])
-                if iv > 0 and not np.isnan(iv):
-                    call_iv_map[float(strike)] = iv
-            except Exception:
-                pass
-        for _, row in puts.iterrows():
-            strike = row["strike"]
-            oi = row["openInterest"] if "openInterest" in row and not np.isnan(row["openInterest"]) else 0
-            strikes[strike] = strikes.get(strike, {"call_oi": 0, "put_oi": 0})
-            strikes[strike]["put_oi"] += int(oi)
-            try:
-                iv = float(row["impliedVolatility"])
-                if iv > 0 and not np.isnan(iv):
-                    put_iv_map[float(strike)] = iv
-            except Exception:
-                pass
+            j = resp.json()
+            for c in (j.get("results") or []):
+                det = c.get("details") or {}
+                try:
+                    k = float(det.get("strike_price"))
+                except Exception:
+                    continue
+                strikes.add(k)
+                oi = c.get("open_interest")
+                iv = c.get("implied_volatility")
+                vol = (c.get("day") or {}).get("volume") or 0.0
+                if det.get("contract_type") == "call":
+                    if oi and oi > 0: call_oi[k] = float(oi)
+                    if iv and 0 < iv < 5: call_iv[k] = float(iv)     # <500% drops deep-strike garbage IV
+                    call_vol += float(vol or 0)
+                else:
+                    if oi and oi > 0: put_oi[k] = float(oi)
+                    if iv and 0 < iv < 5: put_iv[k] = float(iv)
+                    put_vol += float(vol or 0)
+            nxt = j.get("next_url")
+            url, params, pages = (nxt, {"apiKey": POLYGON_KEY}, pages + 1) if nxt else (None, params, pages)
         if not strikes:
+            return None
+        spot = _spot_price(ticker)
+        exp_close = datetime.strptime(exp_str, "%Y-%m-%d").replace(hour=16, minute=0)
+        dte_years = max((exp_close - datetime.now()).total_seconds(), 3600) / (365.0 * 24 * 3600)
+        return {"expiry": exp_str, "dte_years": dte_years, "spot": spot,
+                "strikes": sorted(strikes), "call_iv": call_iv, "put_iv": put_iv,
+                "call_oi": call_oi, "put_oi": put_oi,
+                "call_vol_total": call_vol, "put_vol_total": put_vol}
+    except Exception:
+        return None
+
+def get_max_pain_strike(ticker):
+    """Returns (max_pain_strike, current_price, expiry_date, total_oi_at_pain, atm_iv, skew) from the
+    POLYGON chain (real OI + IV) via the shared _polygon_chain (cached 120s). Max-pain is computed
+    over strikes that actually carry OI; ATM IV + 25-delta skew come off the same chain."""
+    try:
+        ch = _polygon_chain(ticker)
+        if not ch:
             return None, None, None, 0, None, None
-        strike_list = sorted(strikes.keys())
-        min_pain = float("inf")
-        max_pain_strike = None
-        for candidate in strike_list:
-            pain = 0
-            for strike, oi in strikes.items():
-                if strike > candidate:
-                    pain += (strike - candidate) * oi["call_oi"]
-                elif strike < candidate:
-                    pain += (candidate - strike) * oi["put_oi"]
+        call_oi, put_oi = ch["call_oi"], ch["put_oi"]
+        oi_strikes = sorted(set(call_oi) | set(put_oi))
+        if not oi_strikes:
+            return None, None, None, 0, None, None
+        min_pain, max_pain_strike = float("inf"), None
+        for candidate in oi_strikes:
+            pain = 0.0
+            for k in oi_strikes:
+                if k > candidate:
+                    pain += (k - candidate) * call_oi.get(k, 0.0)
+                elif k < candidate:
+                    pain += (candidate - k) * put_oi.get(k, 0.0)
             if pain < min_pain:
-                min_pain = pain
-                max_pain_strike = candidate
-        # OI sitting at the pin — reuse the chain we already have (no second fetch)
-        pain_oi = strikes.get(max_pain_strike, {"call_oi": 0, "put_oi": 0})
-        total_oi_at_pain = pain_oi["call_oi"] + pain_oi["put_oi"]
-        current_price = None
-        try:
-            url_price = POLYGON_BASE_URL + "/v2/last/trade/" + ticker
-            price_resp = requests.get(url_price, params={"apiKey": POLYGON_KEY}, timeout=5)
-            price_data = price_resp.json()
-            if price_data.get("status") == "OK" and "results" in price_data:
-                current_price = price_data["results"].get("p")
-        except:
-            pass
-        if current_price is None:
-            try:
-                current_price = stock.history(period="1d")["Close"].iloc[-1]
-            except:
-                pass
-        # ATM IV for daily IV-history logging — reuses THIS chain (no extra fetch): the strike
-        # nearest spot, mean of its call & put IV. Logged on the main thread by the caller.
+                min_pain, max_pain_strike = pain, candidate
+        if max_pain_strike is None:
+            return None, None, None, 0, None, None
+        total_oi_at_pain = int(call_oi.get(max_pain_strike, 0) + put_oi.get(max_pain_strike, 0))
+        current_price = ch.get("spot")
+        expiry_date = datetime.strptime(ch["expiry"], "%Y-%m-%d").date()
+        # ATM IV (daily IV log): strike nearest spot, mean of its call & put IV.
         atm_iv = None
         try:
-            if current_price and strike_list:
-                k = min(strike_list, key=lambda x: abs(x - current_price))
-                ivs = []
-                for side in (calls, puts):
-                    row = side.loc[side["strike"] == k, "impliedVolatility"]
-                    if len(row):
-                        v = float(row.iloc[0])
-                        if v and v > 0 and not np.isnan(v):
-                            ivs.append(v)
+            if current_price:
+                k = min(ch["strikes"], key=lambda x: abs(x - current_price))
+                ivs = [v for v in (ch["call_iv"].get(k), ch["put_iv"].get(k)) if v and v > 0]
                 if ivs:
                     atm_iv = sum(ivs) / len(ivs)
         except Exception:
             atm_iv = None
-        # 25-delta volatility skew (Phase 4) from the same chain — logged daily by the caller.
+        # 25-delta skew (daily skew log) off the same chain.
         skew = None
         try:
-            _T = max((datetime(expiry_date.year, expiry_date.month, expiry_date.day, 16, 0)
-                      - datetime.now()).total_seconds(), 3600) / (365.0 * 24 * 3600)
-            skew = compute_skew({"call_iv": call_iv_map, "put_iv": put_iv_map, "dte_years": _T},
-                                current_price)
+            skew = compute_skew({"call_iv": ch["call_iv"], "put_iv": ch["put_iv"],
+                                 "dte_years": ch["dte_years"]}, current_price)
         except Exception:
             skew = None
         return max_pain_strike, current_price, expiry_date, total_oi_at_pain, atm_iv, skew
     except Exception:
-        # Cached function — return quietly rather than rendering an st.error on every cache miss
         return None, None, None, 0, None, None
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1256,76 +1285,17 @@ def get_futures_regime(futures_data, vix=None):
 
     return regime, risks
 
-@st.cache_data(ttl=120, show_spinner=False)
 def get_option_chain_snapshot(ticker):
-    """Nearest-expiry option chain reduced to what the computed columns need:
-    the strike ladder and per-strike implied vol for calls and puts, plus the
-    year-fraction to expiry. Cached by ticker (120s) so repeated reruns are free.
-    Returns None on any failure."""
-    try:
-        stock = _yf_ticker(ticker)
-        exps = _yf_options(stock)
-        if not exps:
-            return None
-        today = datetime.now().date()
-        exp_str = None
-        for e in exps:
-            if datetime.strptime(e, "%Y-%m-%d").date() >= today:
-                exp_str = e
-                break
-        if exp_str is None:
-            return None
-        chain = stock.option_chain(exp_str)
-
-        def _side_maps(side):
-            """Per-strike IV map + OI map + total traded volume in one pass over the chain side."""
-            iv_m, oi_m, vol = {}, {}, 0.0
-            for _, row in side.iterrows():
-                try:
-                    k = float(row["strike"])
-                except Exception:
-                    continue
-                try:
-                    iv = float(row["impliedVolatility"])
-                    if iv and iv > 0 and not np.isnan(iv):
-                        iv_m[k] = iv
-                except Exception:
-                    pass
-                try:
-                    oi = float(row["openInterest"])
-                    if oi and oi > 0 and not np.isnan(oi):
-                        oi_m[k] = oi
-                except Exception:
-                    pass
-                try:
-                    v = float(row["volume"])
-                    if v and v > 0 and not np.isnan(v):
-                        vol += v
-                except Exception:
-                    pass
-            return iv_m, oi_m, vol
-
-        call_iv, call_oi, call_vol_total = _side_maps(chain.calls)
-        put_iv, put_oi, put_vol_total = _side_maps(chain.puts)
-        strikes = set()
-        for side in (chain.calls, chain.puts):
-            for s in side["strike"].tolist():
-                try:
-                    strikes.add(float(s))
-                except Exception:
-                    pass
-        strikes = sorted(strikes)
-        if not strikes:
-            return None
-        exp_close = datetime.strptime(exp_str, "%Y-%m-%d").replace(hour=16, minute=0)
-        secs = (exp_close - datetime.now()).total_seconds()
-        dte_years = max(secs, 3600) / (365.0 * 24 * 3600)   # floor at 1h so 0DTE delta stays finite
-        return {"expiry": exp_str, "dte_years": dte_years, "strikes": strikes,
-                "call_iv": call_iv, "put_iv": put_iv,
-                "call_oi": call_oi, "put_oi": put_oi,
-                "call_vol_total": call_vol_total, "put_vol_total": put_vol_total}
-    except Exception:
+    """Nearest-expiry option chain for the computed columns (GEX / P/C / skew / strike+delta / IV).
+    Now a thin view over the shared Polygon _polygon_chain (cached there, 120s) — same output keys as
+    the old yfinance version, so every downstream consumer is unchanged. Returns None on failure."""
+    ch = _polygon_chain(ticker)
+    if not ch or not ch.get("strikes"):
         return None
+    return {"expiry": ch["expiry"], "dte_years": ch["dte_years"], "strikes": ch["strikes"],
+            "call_iv": ch["call_iv"], "put_iv": ch["put_iv"],
+            "call_oi": ch["call_oi"], "put_oi": ch["put_oi"],
+            "call_vol_total": ch["call_vol_total"], "put_vol_total": ch["put_vol_total"]}
 
 def _bs_delta(S, K, T, sigma, r, is_call):
     """Black-Scholes delta. Returns None on degenerate inputs."""
