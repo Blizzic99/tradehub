@@ -1213,7 +1213,7 @@ def get_futures_data():
                 "trend": "UP" if last >= prev_close else "DOWN"}
 
     try:
-        raw = yf.download(tickers, period="2d", interval="1d", group_by="ticker",
+        raw = yf.download(tickers, period="5d", interval="1d", group_by="ticker",
                           progress=False, auto_adjust=False, threads=True, session=_YF_SESSION)
     except Exception:
         raw = None
@@ -1232,7 +1232,7 @@ def get_futures_data():
     for short, tk in FUTURES_WATCHLIST.items():        # individual retry for anything the batch dropped
         if out[short] is None:
             try:
-                out[short] = _parse(yf.download(tk, period="2d", interval="1d",
+                out[short] = _parse(yf.download(tk, period="5d", interval="1d",
                                                 progress=False, session=_YF_SESSION))
             except Exception:
                 out[short] = None
@@ -2471,7 +2471,8 @@ if not st.session_state.initial_scan_done or re_scan:
             st.caption("Change % is the latest daily bar vs the prior close. ES/NQ/YM/RTY = equity "
                        "index futures; CL = crude, GC = gold, ZB/ZN = Treasuries, DX = dollar index.")
         else:
-            st.info("No futures data available (Yahoo connectivity / rate-limit). Try REFRESH SCAN.")
+            st.info("No futures data right now — Yahoo returned too few bars (holiday/off-hours) or is "
+                    "throttling. Try REFRESH SCAN; it reloads once Yahoo responds with 2+ sessions.")
 
     # ============================================================
     # TAB 1 — MAGNET PINS
