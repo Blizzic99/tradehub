@@ -748,6 +748,58 @@ def _polygon_chain(ticker):
     except Exception:
         return None
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _atm_iv_30d(ticker):
+    """~30-DAY CONSTANT-MATURITY at-the-money IV from the Polygon snapshot. This is the reference fed
+    to IV Rank/Percentile and to the daily IV log, so 'current IV' matches the ~30-day (standard
+    monthly, 3rd-Friday) tenor of the backfilled history (alpha_backtest.backfill_iv_history) instead
+    of drifting with the nearest weekly expiry that _polygon_chain returns. Targets the nearest
+    monthly >= 21 DTE, reads the ATM strike's call+put implied_vol and returns their mean. None on
+    failure -- the caller then SKIPS logging that day rather than mixing a weekly reading into a
+    monthly series. NOTE: the trade's stop/target (compute_trade_mechanics._atm_iv) still uses the
+    nearest-expiry IV, which is correct there since the trade is on that expiry."""
+    try:
+        if not POLYGON_KEY:
+            return None
+        spot = _spot_price(ticker)
+        if spot is None:
+            return None
+        cutoff = (datetime.now() + timedelta(days=21)).date()   # nearest monthly >= 21 DTE
+        y, m, exp = cutoff.year, cutoff.month, None
+        for _ in range(4):
+            wd = datetime(y, m, 1).weekday()
+            tf = datetime(y, m, 1 + (4 - wd) % 7 + 14).date()   # 1st Friday + 2 weeks = 3rd Friday
+            if tf >= cutoff:
+                exp = tf
+                break
+            m = m + 1 if m < 12 else 1
+            y = y if m != 1 else y + 1
+        if exp is None:
+            return None
+        r = requests.get(POLYGON_BASE_URL + "/v3/snapshot/options/" + ticker,
+                         params={"apiKey": POLYGON_KEY, "expiration_date": exp.isoformat(),
+                                 "strike_price.gte": round(spot * 0.97, 2),
+                                 "strike_price.lte": round(spot * 1.03, 2), "limit": 250}, timeout=12)
+        if r.status_code != 200:
+            return None
+        by_strike = {}
+        for c in (r.json().get("results") or []):
+            det = c.get("details") or {}
+            try:
+                k = float(det.get("strike_price"))
+            except Exception:
+                continue
+            iv = c.get("implied_volatility")
+            if iv and 0 < iv < 5:                               # <500% drops deep-strike garbage IV
+                by_strike.setdefault(k, {})[det.get("contract_type")] = float(iv)
+        if not by_strike:
+            return None
+        nk = min(by_strike, key=lambda k: abs(k - spot))        # ATM strike (nearest to spot)
+        ivs = [by_strike[nk][t] for t in ("call", "put") if t in by_strike[nk]]
+        return sum(ivs) / len(ivs) if ivs else None
+    except Exception:
+        return None
+
 def get_max_pain_strike(ticker):
     """Returns (max_pain_strike, current_price, expiry_date, total_oi_at_pain, atm_iv, skew) from the
     POLYGON chain (real OI + IV) via the shared _polygon_chain (cached 120s). Max-pain is computed
@@ -1919,10 +1971,12 @@ def attach_computed_columns(df, vix=None, with_gex=False):
             r.get("_vol_ratio"), vix, r.get("_trigger_dt"), now_et)
         cols["Trade Readiness"].append(verdict)
         cols["Readiness Note"].append(note)
-        # Phase 2: IV (of the traded strike) + IV Rank & IV Percentile (of the stable ATM IV).
-        # Daily IV logging now happens once per ticker in the magnet loop (full watchlist, main
-        # thread) — NOT here, which would double-log and race across the parallel tables.
-        atm = m.get("_atm_iv")
+        # Phase 2: IV column = IV of the actual traded (nearest-expiry) strike. IV Rank/Percentile
+        # rank the ~30-day CONSTANT-MATURITY ATM IV against the ~30-day backfilled+logged history, so
+        # the comparison is apples-to-apples on tenor (not a 0-7 DTE weekly vs a monthly series).
+        # Daily IV logging happens once per ticker in the magnet loop (full watchlist, main thread) —
+        # NOT here, which would double-log and race across the parallel tables.
+        atm = _atm_iv_30d(ticker)
         cols["IV"].append(str(round(m["_iv"] * 100, 1)) + "%" if m.get("_iv") else "N/A")
         rank, pct, src = compute_iv_metrics(ticker, atm)
         mark = "~" if src == "proxy" else ""
@@ -2481,13 +2535,14 @@ if not st.session_state.initial_scan_done or re_scan:
         st.subheader("Magnet Pin Signals (Dealer Hedging Targets)")
         with st.spinner("Calculating max pain for watchlist..."):
             mp_results = _parallel_map(get_max_pain_strike, CORE_WATCHLIST)   # concurrent fetch
+            iv30_map = dict(zip(CORE_WATCHLIST, _parallel_map(_atm_iv_30d, CORE_WATCHLIST)))  # ~30d constant-maturity IV, in parallel
             failed_tickers = []   # tickers with no usable options data (fetch failure / rate-limit / none listed)
             for ticker, res in zip(CORE_WATCHLIST, mp_results):
                 if res is None:                       # worker raised (isolated by _parallel_map)
                     failed_tickers.append(ticker)
                     continue
                 max_pain, current_price, expiry, total_oi, atm_iv, skew = res
-                record_iv(ticker, atm_iv)     # full-watchlist daily IV logging (main thread — no file race)
+                record_iv(ticker, iv30_map.get(ticker))   # daily IV log = ~30d constant-maturity (matches backfilled history); skips ticker if None (main thread — no file race)
                 record_skew(ticker, skew)     # full-watchlist daily skew logging (main thread)
                 if max_pain and current_price:
                     record_magnet(ticker, max_pain, current_price, expiry)   # forward-test log (no lookahead)
