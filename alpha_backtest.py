@@ -1261,6 +1261,168 @@ def cost_check(csv_path, signal_type=None, iv=0.30, hold_days_override=None, ver
 
 
 # ==================================================================================
+# REAL IV-RANK BACKFILL — reconstruct a ~52-week ATM implied-vol series from Polygon
+# historical option prices (BS-solved), so IV Rank uses REAL IV instead of the proxy.
+# ==================================================================================
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _bs_call(S, K, T, r, sig):
+    d1 = (math.log(S / K) + (r + 0.5 * sig * sig) * T) / (sig * math.sqrt(T))
+    d2 = d1 - sig * math.sqrt(T)
+    return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+
+def _bs_iv(price, S, K, T, r, is_call=True):
+    """Bisection implied vol from an option price. None if degenerate or it hits the search bounds
+    (deep ITM/OTM with no time value, or garbage price)."""
+    if not (price and price > 0 and S > 0 and K > 0 and T > 0):
+        return None
+    intrinsic = max(S - K, 0.0) if is_call else max(K - S, 0.0)
+    if price <= intrinsic + 1e-6:            # no time value -> unsolvable
+        return None
+    lo, hi = 1e-3, 5.0
+    for _ in range(64):
+        mid = (lo + hi) / 2.0
+        p = _bs_call(S, K, T, r, mid) if is_call else _bs_call(S, K, T, r, mid) - S + K * math.exp(-r * T)
+        if p > price:
+            hi = mid
+        else:
+            lo = mid
+    iv = (lo + hi) / 2.0
+    return iv if 0.005 < iv < 4.9 else None
+
+def _third_friday(y, m):
+    d = date(y, m, 1)
+    return date(y, m, 1 + (4 - d.weekday()) % 7 + 14)     # first Friday (wd 4) + 2 weeks
+
+def _target_expiry(D, min_dte=21):
+    """Nearest standard monthly expiry (3rd Friday) at least min_dte days after D."""
+    cutoff = D + timedelta(days=min_dte)
+    y, m = cutoff.year, cutoff.month
+    for _ in range(4):
+        tf = _third_friday(y, m)
+        if tf >= cutoff:
+            return tf
+        m = m + 1 if m < 12 else 1
+        y = y if m != 1 else y + 1
+    return None
+
+_STRIKE_CACHE = {}
+def _expiry_strikes(ticker, exp_str, key):
+    """Sorted call strikes listed for (ticker, expiry) — expired contracts included for past
+    expiries. Cached per (ticker, expiry) since ~4 weeks of sample dates share one monthly expiry."""
+    ck = (ticker, exp_str)
+    if ck in _STRIKE_CACHE:
+        return _STRIKE_CACHE[ck]
+    strikes = []
+    exp_past = date.fromisoformat(exp_str) < date.today()
+    url = POLYGON_BASE_URL + "/v3/reference/options/contracts"
+    params = {"apiKey": key, "underlying_ticker": ticker, "expiration_date": exp_str,
+              "contract_type": "call", "expired": "true" if exp_past else "false", "limit": 250}
+    pages = 0
+    while url and pages < 6:
+        _poly_throttle(0.15)
+        try:
+            j = requests.get(url, params=params, timeout=15).json()
+        except Exception:
+            break
+        for c in (j.get("results") or []):
+            try:
+                strikes.append(float(c["strike_price"]))
+            except Exception:
+                pass
+        nxt = j.get("next_url")
+        url, params, pages = (nxt, {"apiKey": key}, pages + 1) if nxt else (None, params, pages)
+    strikes = sorted(set(strikes))
+    _STRIKE_CACHE[ck] = strikes
+    return strikes
+
+def backfill_iv_history(tickers, days_step=3, window_days=365, min_dte=21,
+                        out="iv_history.json", rate=0.045, verbose=True):
+    """Reconstruct a REAL ~52-week ATM implied-vol series per ticker from Polygon historical option
+    prices and MERGE it into iv_history.json (so the scanner's IV Rank flips from the realized-vol
+    proxy to real logged IV once >= IV_HISTORY_MIN_REAL distinct days exist). For each sample date
+    (every days_step trading days over the past window_days): spot from the stock daily bar; nearest
+    monthly expiry >= min_dte out; nearest listed strike; that ATM call's close on the date;
+    BS-solve IV. Sampling ~every 3 trading days gives ~84 real points/year (> the 60 threshold).
+    Merges with existing (forward-logged) points, deduped per date, capped to 260."""
+    key = _polygon_key()
+    if not key:
+        print("No Polygon key -- cannot backfill.")
+        return
+    today = date.today()
+    start = today - timedelta(days=window_days)
+    hist = {}
+    if os.path.exists(out):
+        try:
+            hist = json.load(open(out))
+        except Exception:
+            hist = {}
+    total_added = 0
+    for ti, tk in enumerate(tickers, 1):
+        try:
+            _poly_throttle(0.15)
+            j = requests.get(POLYGON_BASE_URL + "/v2/aggs/ticker/%s/range/1/day/%s/%s"
+                             % (tk, start.isoformat(), today.isoformat()),
+                             params={"apiKey": key, "adjusted": "true", "sort": "asc", "limit": 50000},
+                             timeout=20).json()
+        except Exception as e:
+            print("  [%d/%d] %s: stock fetch failed (%s)" % (ti, len(tickers), tk, str(e)[:50]))
+            continue
+        closes = {}
+        for b in (j.get("results") or []):
+            closes[datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date()] = float(b["c"])
+        days = sorted(closes)
+        if len(days) < 30:
+            print("  [%d/%d] %s: too few stock days (%d)" % (ti, len(tickers), tk, len(days)))
+            continue
+        lst = hist.get(tk, [])
+        have = {e.get("date") for e in lst}
+        added = 0
+        for D in days[::days_step]:
+            ds = D.isoformat()
+            if ds in have:
+                continue
+            exp = _target_expiry(D, min_dte)
+            if not exp:
+                continue
+            strikes = _expiry_strikes(tk, exp.isoformat(), key)
+            if not strikes:
+                continue
+            S = closes[D]
+            px = Kused = None
+            for K in sorted(strikes, key=lambda x: abs(x - S))[:3]:   # 3 nearest strikes: thin ATM may not trade
+                occ = "O:%s%sC%08d" % (tk, exp.isoformat().replace("-", "")[2:], int(round(K * 1000)))
+                _poly_throttle(0.15)
+                try:
+                    a = requests.get(POLYGON_BASE_URL + "/v2/aggs/ticker/%s/range/1/day/%s/%s" % (occ, ds, ds),
+                                     params={"apiKey": key, "adjusted": "true"}, timeout=12).json()
+                except Exception:
+                    continue
+                ar = a.get("results") or []
+                if ar and ar[0].get("c"):
+                    px, Kused = ar[0]["c"], K
+                    break
+            if px is None:
+                continue
+            iv = _bs_iv(px, S, Kused, (exp - D).days / 365.0, rate, True)
+            if iv:
+                lst.append({"date": ds, "iv": round(iv, 4)})
+                have.add(ds)
+                added += 1
+        hist[tk] = sorted(lst, key=lambda e: e["date"])[-260:]
+        total_added += added
+        if verbose:
+            print("  [%d/%d] %s: +%d real IV points (%d in file)" % (ti, len(tickers), tk, added, len(hist[tk])))
+    try:
+        json.dump(hist, open(out, "w"))
+    except Exception as e:
+        print("  could not write %s: %s" % (out, str(e)[:60]))
+        return
+    print("Backfill done: +%d real ATM-IV points across %d ticker(s) -> %s" % (total_added, len(tickers), out))
+
+
+# ==================================================================================
 # TRAIN-WINDOW PARAMETER SWEEP — compare threshold variations on TRAIN data only
 # ==================================================================================
 SWEEP_PARAMS = ("vol_confirm", "orb_min_range_pct", "orb_break_buffer_frac", "vwap_max_vix")
@@ -1379,7 +1541,19 @@ if __name__ == "__main__":
                     help="With --cost-check, filter to one signal_type (e.g. ORB or VWAP).")
     ap.add_argument("--iv", type=float, default=0.30,
                     help="With --cost-check, the assumed ATM implied vol (default 0.30).")
+    ap.add_argument("--backfill-iv", action="store_true",
+                    help="Reconstruct a real ~52-week ATM IV series per ticker from Polygon historical "
+                         "option prices and merge into iv_history.json (replaces the realized-vol proxy). "
+                         "Uses --tickers (default CORE_WATCHLIST) and --iv-step.")
+    ap.add_argument("--iv-step", type=int, default=3,
+                    help="With --backfill-iv, sample every N trading days (default 3 ~= 84 points/yr > 60).")
     args = ap.parse_args()
+
+    if args.backfill_iv:
+        tks = ([t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+               if args.tickers else list(CORE_WATCHLIST))
+        backfill_iv_history(tks, days_step=args.iv_step)
+        raise SystemExit(0)
 
     if args.magnet_pipeline:
         magnet_pipeline_report(max_distance_pct=args.max_distance, target_n=args.target_n)
