@@ -1358,67 +1358,81 @@ def backfill_iv_history(tickers, days_step=3, window_days=365, min_dte=21,
             hist = json.load(open(out))
         except Exception:
             hist = {}
+    def _save():
+        """Atomic checkpoint: write to a temp file then os.replace() so a process kill mid-write
+        (e.g. the exit-code-4 crash that struck at ticker 45/GME) can never corrupt or truncate the
+        real file. Called after EVERY ticker so a crash loses at most the in-progress ticker, not the
+        whole run -- the original code json.dump'd only once at the end, so that crash discarded ~3000
+        already-computed IV points."""
+        try:
+            tmp = out + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(hist, f)
+            os.replace(tmp, out)
+            return True
+        except Exception as e:
+            print("  could not write %s: %s" % (out, str(e)[:60]))
+            return False
+
     total_added = 0
     for ti, tk in enumerate(tickers, 1):
-        try:
-            _poly_throttle(0.15)
+        try:                                        # whole-ticker isolation: one bad ticker (a data
+            _poly_throttle(0.15)                    # quirk, a transient error) is SKIPPED, never fatal
             j = requests.get(POLYGON_BASE_URL + "/v2/aggs/ticker/%s/range/1/day/%s/%s"
                              % (tk, start.isoformat(), today.isoformat()),
                              params={"apiKey": key, "adjusted": "true", "sort": "asc", "limit": 50000},
                              timeout=20).json()
-        except Exception as e:
-            print("  [%d/%d] %s: stock fetch failed (%s)" % (ti, len(tickers), tk, str(e)[:50]))
-            continue
-        closes = {}
-        for b in (j.get("results") or []):
-            closes[datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date()] = float(b["c"])
-        days = sorted(closes)
-        if len(days) < 30:
-            print("  [%d/%d] %s: too few stock days (%d)" % (ti, len(tickers), tk, len(days)))
-            continue
-        lst = hist.get(tk, [])
-        have = {e.get("date") for e in lst}
-        added = 0
-        for D in days[::days_step]:
-            ds = D.isoformat()
-            if ds in have:
+            closes = {}
+            for b in (j.get("results") or []):
+                closes[datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date()] = float(b["c"])
+            days = sorted(closes)
+            if len(days) < 30:
+                print("  [%d/%d] %s: too few stock days (%d)" % (ti, len(tickers), tk, len(days)))
                 continue
-            exp = _target_expiry(D, min_dte)
-            if not exp:
-                continue
-            strikes = _expiry_strikes(tk, exp.isoformat(), key)
-            if not strikes:
-                continue
-            S = closes[D]
-            px = Kused = None
-            for K in sorted(strikes, key=lambda x: abs(x - S))[:3]:   # 3 nearest strikes: thin ATM may not trade
-                occ = "O:%s%sC%08d" % (tk, exp.isoformat().replace("-", "")[2:], int(round(K * 1000)))
-                _poly_throttle(0.15)
-                try:
-                    a = requests.get(POLYGON_BASE_URL + "/v2/aggs/ticker/%s/range/1/day/%s/%s" % (occ, ds, ds),
-                                     params={"apiKey": key, "adjusted": "true"}, timeout=12).json()
-                except Exception:
+            lst = hist.get(tk, [])
+            have = {e.get("date") for e in lst}
+            added = 0
+            for D in days[::days_step]:
+                ds = D.isoformat()
+                if ds in have:
                     continue
-                ar = a.get("results") or []
-                if ar and ar[0].get("c"):
-                    px, Kused = ar[0]["c"], K
-                    break
-            if px is None:
-                continue
-            iv = _bs_iv(px, S, Kused, (exp - D).days / 365.0, rate, True)
-            if iv:
-                lst.append({"date": ds, "iv": round(iv, 4)})
-                have.add(ds)
-                added += 1
-        hist[tk] = sorted(lst, key=lambda e: e["date"])[-260:]
-        total_added += added
-        if verbose:
-            print("  [%d/%d] %s: +%d real IV points (%d in file)" % (ti, len(tickers), tk, added, len(hist[tk])))
-    try:
-        json.dump(hist, open(out, "w"))
-    except Exception as e:
-        print("  could not write %s: %s" % (out, str(e)[:60]))
-        return
+                exp = _target_expiry(D, min_dte)
+                if not exp:
+                    continue
+                strikes = _expiry_strikes(tk, exp.isoformat(), key)
+                if not strikes:
+                    continue
+                S = closes[D]
+                px = Kused = None
+                for K in sorted(strikes, key=lambda x: abs(x - S))[:3]:   # 3 nearest strikes: thin ATM may not trade
+                    occ = "O:%s%sC%08d" % (tk, exp.isoformat().replace("-", "")[2:], int(round(K * 1000)))
+                    _poly_throttle(0.15)
+                    try:
+                        a = requests.get(POLYGON_BASE_URL + "/v2/aggs/ticker/%s/range/1/day/%s/%s" % (occ, ds, ds),
+                                         params={"apiKey": key, "adjusted": "true"}, timeout=12).json()
+                    except Exception:
+                        continue
+                    ar = a.get("results") or []
+                    if ar and ar[0].get("c"):
+                        px, Kused = ar[0]["c"], K
+                        break
+                if px is None:
+                    continue
+                iv = _bs_iv(px, S, Kused, (exp - D).days / 365.0, rate, True)
+                if iv:
+                    lst.append({"date": ds, "iv": round(iv, 4)})
+                    have.add(ds)
+                    added += 1
+            hist[tk] = sorted(lst, key=lambda e: e["date"])[-260:]
+            total_added += added
+            _save()                                 # CHECKPOINT: persist through this ticker
+            if verbose:
+                print("  [%d/%d] %s: +%d real IV points (%d in file)" % (ti, len(tickers), tk, added, len(hist[tk])))
+        except Exception as e:
+            print("  [%d/%d] %s: SKIPPED (%s: %s)" % (ti, len(tickers), tk, type(e).__name__, str(e)[:80]))
+            _save()                                 # persist everything through the last good ticker
+            continue
+    _save()
     print("Backfill done: +%d real ATM-IV points across %d ticker(s) -> %s" % (total_added, len(tickers), out))
 
 

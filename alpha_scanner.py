@@ -98,15 +98,42 @@ def _parallel_map(fn, items):
 # CONFIG
 # ============================================================
 def _secret(name, default=""):
-    """Read a secret from Streamlit secrets (.streamlit/secrets.toml) first, then the
-    environment, else the default. Keeps API keys/tokens OUT of source so the .py can be
-    shared/version-controlled safely. Create .streamlit/secrets.toml (see secrets.toml.example)."""
+    """Read a secret: Streamlit secrets first (this is how Streamlit CLOUD injects them, and how a
+    LOCAL run picks up .streamlit/secrets.toml when launched from the project dir), then the
+    environment, then the .streamlit/secrets.toml NEXT TO THIS SCRIPT (and ~/.streamlit/secrets.toml)
+    read directly. That last, file-anchored fallback matters: st.secrets only finds secrets.toml
+    RELATIVE TO the directory `streamlit run` was launched from, so launching the app from any other
+    working dir (or a different copy of it) silently blanked POLYGON_KEY and made every options fetch
+    fail — the '49/49 no options data' symptom. Anchoring to __file__ finds the key regardless of CWD.
+    Keeps API keys/tokens OUT of source so the .py can be shared/version-controlled safely."""
     try:
         if name in st.secrets:
             return st.secrets[name]
     except Exception:
         pass
-    return os.environ.get(name, default)
+    v = os.environ.get(name)
+    if v:
+        return v
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, ".streamlit", "secrets.toml"),
+                 os.path.join(os.path.expanduser("~"), ".streamlit", "secrets.toml")):
+        if not os.path.exists(path):
+            continue
+        try:                                        # preferred: real TOML parse (stdlib 3.11+)
+            import tomllib
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+            if name in data:
+                return data[name]
+        except Exception:                           # fallback: minimal KEY = "value" line parse
+            try:
+                for line in open(path, encoding="utf-8"):
+                    k, _, val = line.partition("=")
+                    if k.strip() == name:
+                        return val.strip().strip('"').strip("'")
+            except Exception:
+                pass
+    return default
 
 POLYGON_KEY = _secret("POLYGON_KEY")
 POLYGON_BASE_URL = "https://api.polygon.io"
@@ -2533,6 +2560,13 @@ if not st.session_state.initial_scan_done or re_scan:
     # ============================================================
     with tab_magnet:
         st.subheader("Magnet Pin Signals (Dealer Hedging Targets)")
+        if not POLYGON_KEY:
+            st.error("**Polygon API key not found — all options data is unavailable.** "
+                     "Every options metric (max pain, OI, IV, GEX, skew, P/C) comes from Polygon, so "
+                     "the whole watchlist shows no data without it. Fix: set `POLYGON_KEY` in "
+                     "`.streamlit/secrets.toml` next to alpha_scanner.py (local runs — now resolved no "
+                     "matter which folder you launch from), or in the app's **Secrets** on Streamlit "
+                     "Cloud (deployed). This is NOT a rate-limit or a market-hours issue.")
         with st.spinner("Calculating max pain for watchlist..."):
             mp_results = _parallel_map(get_max_pain_strike, CORE_WATCHLIST)   # concurrent fetch
             iv30_map = dict(zip(CORE_WATCHLIST, _parallel_map(_atm_iv_30d, CORE_WATCHLIST)))  # ~30d constant-maturity IV, in parallel
@@ -2576,9 +2610,17 @@ if not st.session_state.initial_scan_done or re_scan:
                     failed_tickers.append(ticker)   # fetch returned no max-pain/price for this ticker
 
         if failed_tickers:
-            st.caption("⚠️ No options data for " + str(len(failed_tickers)) + "/"
-                       + str(len(CORE_WATCHLIST)) + ": " + ", ".join(failed_tickers)
-                       + " — timeout, rate-limit, or no listed options (not a signal-quality issue).")
+            if POLYGON_KEY and len(failed_tickers) == len(CORE_WATCHLIST):
+                # Key present but EVERY ticker failed -> not per-ticker noise; a Polygon-wide problem.
+                st.warning("⚠️ Options data failed for ALL " + str(len(CORE_WATCHLIST)) + " tickers "
+                           "despite a configured key — likely a Polygon outage, an expired/downgraded "
+                           "subscription (options snapshot needs the entitled plan), or a rate-limit. "
+                           "Try REFRESH SCAN; if it persists, check the Polygon dashboard.")
+            elif POLYGON_KEY:
+                st.caption("⚠️ No options data for " + str(len(failed_tickers)) + "/"
+                           + str(len(CORE_WATCHLIST)) + ": " + ", ".join(failed_tickers)
+                           + " — timeout, rate-limit, or no listed options (not a signal-quality issue).")
+            # (key-missing case already shown as a prominent st.error above)
 
         if magnet_results:
             df_magnet = pd.DataFrame(magnet_results)
