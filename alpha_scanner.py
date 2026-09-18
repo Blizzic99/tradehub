@@ -2286,10 +2286,43 @@ C_MUTED     = "#8B93A7"
 C_PRIMARY   = "#3B82F6"   # blue (calls / up / info)
 C_ACCENT    = "#D97706"   # amber (warnings / moderate)
 C_GREEN     = "#16A34A"   # bullish / strong / gain
-C_RED       = "#DC2626"   # bearish / loss / blow-off
+C_RED       = "#EF4444"   # bearish / loss / blow-off (brightened from #DC2626 for WCAG-AA 4.5:1
+                          # body-text contrast on both C_BG and C_RED_BG; old value failed at 4.07/3.72)
 C_GREEN_BG  = "#0E2A1A"   # muted green fill for table cells
 C_AMBER_BG  = "#2C2208"   # muted amber fill
 C_RED_BG    = "#2A0E0E"   # muted red fill
+
+# --- Non-color state glyphs (WCAG 1.4.1: never convey status by color alone). These are DISPLAY-ONLY
+# formatters applied via Styler.format, so the raw cell value is unchanged and the filters / sorts /
+# cell-color maps that read the raw value keep working. A screen reader can't read the st.dataframe
+# canvas at all, so each such table ALSO gets a plain-text <ul> equivalent (see _sr_table_summary).
+def _icon_readiness(v):
+    s = str(v)
+    return ("✓ " if "PASS" in s else "✗ " if "FAIL" in s else "") + s
+def _icon_strength(v):
+    return {"STRONG": "▲ STRONG", "MODERATE": "◆ MODERATE", "WEAK": "▽ WEAK"}.get(str(v), str(v))
+def _icon_tier(v):
+    s = str(v)
+    return ("● " if "HIGH" in s else "◐ " if "MEDIUM" in s else "○ ") + s if s and s != "None" else s
+def _icon_regime(v):
+    s = str(v)
+    return ("▲ " if "POSITIVE" in s else "▼ " if "NEGATIVE" in s else "") + s
+def _icon_status(v):
+    s = str(v); u = s.upper()
+    return ("▲ " if "GAIN" in u else "▼ " if ("LOSS" in u or "EXIT" in u) else "◆ ") + s
+
+def _sr_table_summary(df, sentence, heading):
+    """Render an accessible plain-text <ul> equivalent of a canvas st.dataframe inside an expander,
+    for screen-reader users (the glide-data-grid canvas is not exposed to assistive tech). `sentence`
+    maps a row -> one plain sentence."""
+    try:
+        rows = [sentence(r) for _, r in df.iterrows()]
+    except Exception:
+        return
+    if not rows:
+        return
+    with st.expander("🔊 " + heading + " — plain-text summary (screen-reader accessible)"):
+        st.markdown("\n".join("- " + r for r in rows))
 
 st.markdown(f"""
 <style>
@@ -2336,15 +2369,42 @@ hr {{ border-color: {C_BORDER} !important; }}
   padding: 5px 13px; font-size: 0.88rem; color: {C_TEXT}; font-weight: 600; }}
 .pill .k {{ color: {C_MUTED}; font-weight: 500; margin-right: 6px; text-transform: uppercase;
   font-size: 0.7rem; letter-spacing: 0.05em; }}
+/* --- Accessibility: visible keyboard focus indicator (WCAG 2.4.7) on every control --- */
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible,
+textarea:focus-visible, [role="tab"]:focus-visible, [role="button"]:focus-visible,
+[data-baseweb="tab"]:focus-visible, summary:focus-visible, [tabindex]:focus-visible,
+[data-testid="stDataFrameResizable"]:focus-visible {{
+  outline: 3px solid {C_PRIMARY} !important; outline-offset: 2px !important; border-radius: 6px;
+}}
+.stCheckbox:focus-within, .stSelectbox:focus-within, .stTextInput:focus-within {{
+  outline: 2px solid {C_PRIMARY}; outline-offset: 2px; border-radius: 8px;
+}}
+/* Hover / focus affordance on interactive cards */
+.pill {{ transition: border-color 160ms ease; }}
+.pill:hover, .pill:focus-within,
+[data-testid="stMetric"]:hover, .verdict:hover {{ border-color: {C_PRIMARY}; }}
+/* Screen-reader-only text: visually hidden but announced (table text-equivalents) */
+.sr-only {{ position:absolute !important; width:1px; height:1px; padding:0; margin:-1px;
+  overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }}
+/* "Last updated" freshness stamp */
+.updated-stamp {{ color:{C_MUTED}; font-size:0.78rem; font-weight:500; margin:-2px 0 6px; }}
+.updated-stamp .dot {{ color:{C_GREEN}; font-size:0.7rem; }}
 @media (prefers-reduced-motion: reduce) {{ * {{ transition: none !important; }} }}
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown(
-    '<div class="alpha-header"><span class="title">Alpha&nbsp;Scanner</span>'
+    '<div class="alpha-header"><h1 class="title" style="margin:0;">Alpha&nbsp;Scanner</h1>'
     '<span class="ver">v0.1 · HYBRID</span></div>'
     '<div class="alpha-sub">Magnet pins · blow-off tops · VWAP / ORB · trade tracker · Telegram alerts</div>',
     unsafe_allow_html=True
+)
+# Visible data-freshness stamp (WCAG-friendly; render time ~ latest cached pull within each TTL).
+_refreshed_et = datetime.now(ET_ZONE).strftime("%b %d, %I:%M:%S %p ET")
+st.markdown(
+    '<div class="updated-stamp"><span class="dot">●</span> Last refreshed ' + _refreshed_et
+    + ' — press <strong>REFRESH SCAN</strong> (sidebar) to pull fresh data.</div>',
+    unsafe_allow_html=True,
 )
 
 # Pre-market context
@@ -2358,7 +2418,7 @@ _spy_val = market_context.get("spy_change", "N/A")
 _spy_txt = (("+" if _spy_val >= 0 else "") + str(_spy_val) + "%") if isinstance(_spy_val, (int, float)) else "N/A"
 _bias_color = C_GREEN if market_bias == "FAVORABLE" else (C_RED if market_bias == "HOSTILE" else C_ACCENT)
 st.markdown(
-    '<div class="mkt-strip">'
+    '<div class="mkt-strip" role="group" aria-label="Market status summary">'
     f'<span class="pill"><span class="k">Market</span>{market_status}</span>'
     f'<span class="pill"><span class="k">VIX</span>{_vix_val}</span>'
     f'<span class="pill"><span class="k">SPY</span>{_spy_txt}</span>'
@@ -2383,8 +2443,12 @@ def render_active_tracker():
             elif "LOSS" in str(val) or "EXIT" in str(val):
                 return f"background-color: {C_RED_BG}; color: {C_RED}; font-weight: 600"
             return f"background-color: {C_AMBER_BG}; color: {C_ACCENT}"
-        styled_active = df_active.style.map(color_status, subset=["Status"])
+        styled_active = (df_active.style.map(color_status, subset=["Status"])
+                         .format({"Status": _icon_status}))
         st.dataframe(styled_active, width="stretch", hide_index=True)
+        _sr_table_summary(df_active,
+                          lambda r: "; ".join("%s %s" % (k, v) for k, v in r.items()),
+                          "Active trades")
         st.caption("Refresh (REFRESH SCAN) to update live P&L.")
     else:
         st.info("No active trades. Log a trade below with Result = OPEN to track it live here.")
@@ -2689,8 +2753,17 @@ if not st.session_state.initial_scan_done or re_scan:
                                  .map(color_readiness, subset=["Trade Readiness"])
                                  .map(color_gex_regime, subset=["GEX Regime"])
                                  .map(color_pcr_flag, subset=["P/C Flag"])
-                                 .map(color_skew_trend, subset=["Skew Trend"]))
+                                 .map(color_skew_trend, subset=["Skew Trend"])
+                                 .format({"Signal Strength": _icon_strength, "OI Confidence": _icon_tier,
+                                          "Trade Readiness": _icon_readiness, "GEX Regime": _icon_regime}))
                 st.dataframe(styled_magnet, width="stretch", hide_index=True)
+                _sr_table_summary(
+                    df_show,
+                    lambda r: ("%s: %s, %s strength, max-pain pin %s vs price %s (%s away), OI %s, "
+                               "readiness %s." % (r.get("Ticker"), r.get("Direction"),
+                               r.get("Signal Strength"), r.get("Max Pain Strike"), r.get("Current Price"),
+                               r.get("Distance %"), r.get("OI Confidence"), r.get("Trade Readiness"))),
+                    "Magnet pin signals")
                 st.caption(IV_CAPTION)
                 _ivdays = iv_days_logged()
                 st.caption(("✅ Real logged IV history active (%d days)." % _ivdays)
@@ -2797,9 +2870,14 @@ if not st.session_state.initial_scan_done or re_scan:
             st.info("Not enough intraday data yet (market closed, pre-market, or the opening range hasn't formed). Check back during/after the session.")
         elif vwap_rows:
             df_v = attach_computed_columns(pd.DataFrame(vwap_rows), vix=market_context.get("vix"))
-            st.dataframe(df_v.style.map(color_readiness, subset=["Trade Readiness"]),
+            st.dataframe(df_v.style.map(color_readiness, subset=["Trade Readiness"])
+                         .format({"Trade Readiness": _icon_readiness}),
                          width="stretch", hide_index=True)
             st.caption(IV_CAPTION)
+            _sr_table_summary(df_v, lambda r: ("%s: readiness %s, suggested strike %s, stop %s, "
+                              "target %s." % (r.get("Ticker"), r.get("Trade Readiness"),
+                              r.get("Suggested Strike"), r.get("Stop Price"), r.get("Profit Target"))),
+                              "VWAP reclaim setups")
             st.success("VWAP reclaim setups detected — long bias above VWAP.")
         else:
             st.info("No VWAP reclaim setups on the watchlist right now.")
@@ -2819,9 +2897,14 @@ if not st.session_state.initial_scan_done or re_scan:
         elif orb_rows:
             shown = orb_rows[:ORB_MAX_RESULTS]
             df_o = attach_computed_columns(pd.DataFrame(shown), vix=market_context.get("vix"))
-            st.dataframe(df_o.style.map(color_readiness, subset=["Trade Readiness"]),
+            st.dataframe(df_o.style.map(color_readiness, subset=["Trade Readiness"])
+                         .format({"Trade Readiness": _icon_readiness}),
                          width="stretch", hide_index=True)
             st.caption(IV_CAPTION)
+            _sr_table_summary(df_o, lambda r: ("%s: readiness %s, suggested strike %s, stop %s, "
+                              "target %s." % (r.get("Ticker"), r.get("Trade Readiness"),
+                              r.get("Suggested Strike"), r.get("Stop Price"), r.get("Profit Target"))),
+                              "Opening-range breakouts")
             if len(orb_rows) > ORB_MAX_RESULTS:
                 st.success("Showing top " + str(ORB_MAX_RESULTS) + " of " + str(len(orb_rows))
                            + " opening-range breakouts (ranked by volume conviction).")
