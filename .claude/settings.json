@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/Users/santw/AppData/Local/Python/bin/python.exe C:/Users/santw/OneDrive/Desktop/AlphaScanner/.claude/skills/options-math/hook_check.py"
+          }
+        ]
+      }
+    ]
+  }
+}
