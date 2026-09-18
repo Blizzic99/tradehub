@@ -1849,6 +1849,7 @@ def color_readiness(val):
 # ------------------------------------------------------------
 PHASE3_COLS = ["IV", "IV Rank", "IV Pctl"]
 IV_HISTORY_FILE = "iv_history.json"
+IV_SEED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iv_history_seed.json")
 IV_HISTORY_CAP = 260            # ~a year of trading days (52 weeks ~= 252) + a little buffer
 IV_HISTORY_WINDOW_DAYS = 365    # calendar cutoff for the "past year" window
 IV_HISTORY_MIN_REAL = 60        # min logged trading days before real Rank/Pctl replace the proxy
@@ -1874,6 +1875,24 @@ def save_iv_history(h):
     except Exception:
         pass
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_iv_seed():
+    """Committed ~1-year REAL-IV baseline (iv_history_seed.json, built by
+    alpha_backtest.backfill_iv_history) that SHIPS WITH THE CODE. The live iv_history.json is
+    gitignored and Streamlit Cloud's filesystem is ephemeral (resets on reboot), so on cloud this
+    seed is the ONLY history present — it's what lets IV Rank read 'real' there instead of the proxy.
+    Merged UNDER the live forward-log in _iv_history_obs (a live same-date obs wins). Anchored to
+    __file__ so it resolves no matter which dir launched the app. Refresh by re-running
+    `python alpha_backtest.py --backfill-iv` and re-copying iv_history.json -> iv_history_seed.json,
+    then committing. {} when absent (local runs with a full live log don't need it)."""
+    try:
+        if os.path.exists(IV_SEED_FILE):
+            with open(IV_SEED_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
 def record_iv(ticker, iv):
     """Append (or update) today's ATM IV observation for a ticker. Deduped per day
     so repeated reruns don't inflate the series; capped to the most recent entries."""
@@ -1898,11 +1917,23 @@ def record_iv(ticker, iv):
     save_iv_history(h)
 
 def _iv_history_obs(ticker):
-    """Sorted [(date, iv)] for a ticker within the past IV_HISTORY_WINDOW_DAYS (one obs/day)."""
-    lst = load_iv_history().get(ticker, [])
+    """Sorted [(date, iv)] for a ticker within the past IV_HISTORY_WINDOW_DAYS (one obs/day), MERGING
+    the committed seed baseline with the live forward-log (live wins on a shared date). The merge is
+    what gives the cloud app 'real' IV Rank: iv_history.json is gitignored + the cloud fs is
+    ephemeral, so the seed is cloud's only history; locally the live log simply layers on top. The
+    live forward-log is never polluted with seed rows (record_iv/save operate on it alone)."""
+    by_date = {}
+    for e in _load_iv_seed().get(ticker, []):        # baseline first...
+        d = e.get("date")
+        if d:
+            by_date[d] = e
+    for e in load_iv_history().get(ticker, []):      # ...live forward-log overrides same-date
+        d = e.get("date")
+        if d:
+            by_date[d] = e
     cutoff = datetime.now().date() - timedelta(days=IV_HISTORY_WINDOW_DAYS)
     out = []
-    for e in lst:
+    for e in by_date.values():
         try:
             d = datetime.strptime(e["date"], "%Y-%m-%d").date()
             iv = float(e["iv"])
