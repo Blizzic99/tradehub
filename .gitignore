@@ -47,3 +47,4 @@ desktop.ini
 
 # Backtest output (generated) — canonical run + all comparison/variant runs
 backtest_*.csv
+scan_alert_state.json
