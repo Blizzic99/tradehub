@@ -1265,7 +1265,11 @@ def get_market_bias(context):
 # ============================================================
 RISK_FREE_RATE = 0.045       # annual risk-free rate (per spec)
 STOP_BUFFER = 0.0075         # FALLBACK flat stop offset (used only when IV/DTE unavailable)
-MAGNET_TARGET_OFFSET = 0.30  # exit ~$0.30 before the max-pain pin ($0.20-$0.50 band)
+MAGNET_TARGET_BUFFER_FRAC = 0.20  # exit this FRACTION of the convergence distance BEFORE the pin
+                                  # (target = pin -/+ frac*|pin-price|), so it always sits between
+                                  # entry and pin -> never inverts. Replaces a flat $0.30 offset that
+                                  # exceeded the whole move on low-priced tickers (MARA ~$13) and put
+                                  # the target BELOW entry. Captures (1-frac)=80% of the move to the pin.
 # DTE-aware stop/target sizing: distances scale with the option's expected 1-sigma move,
 # E = price * ATM_IV * sqrt(DTE_years). A 2DTE trade gets a tight stop/target; a 30DTE a wide one.
 STOP_K = 0.5                 # stop at 0.5 x expected move (adverse)
@@ -1742,6 +1746,18 @@ def _expected_move(price, atm_iv, dte_years):
         return price * atm_iv * sqrt(dte_years)
     return None
 
+def _magnet_target(pin, price, is_long, buffer_frac=MAGNET_TARGET_BUFFER_FRAC):
+    """Magnet-pin profit target: exit a BUFFER of the convergence distance BEFORE the pin, so the
+    target always lands strictly between entry and the pin and can never invert (options-math Skill
+    example 6). Long (price below pin): pin - frac*(pin-price); short (price above pin): pin +
+    frac*(price-pin). Captures (1-frac) of the move to the pin. Pure/testable. None on bad inputs."""
+    try:
+        pin = float(pin); price = float(price)
+    except (TypeError, ValueError):
+        return None
+    buf = buffer_frac * abs(pin - price)
+    return (pin - buf) if is_long else (pin + buf)
+
 def _best_exit_window(entry_dte_days):
     """Estimated best exit window for a freshly-opened option (options-math Skill example 12). Pure.
     Short-dated (<=2 DTE) -> a TIME-OF-DAY rule: on a 0-2 DTE option theta decay accelerates through
@@ -1786,7 +1802,7 @@ def compute_trade_mechanics(ticker, price, is_long, signal_type, level, magnet_s
             out["Stop Price"] = "$" + str(round(stop, 2))
 
         if signal_type == "magnet" and isinstance(magnet_strike, (int, float)):
-            tgt = magnet_strike - MAGNET_TARGET_OFFSET if is_long else magnet_strike + MAGNET_TARGET_OFFSET
+            tgt = _magnet_target(magnet_strike, price, is_long)   # proportional buffer -> never inverts
             far = E is not None and abs(magnet_strike - price) > E    # pin more than one expected move away
             out["Profit Target"] = "$" + str(round(tgt, 2)) + (" (>1sd)" if far else "")   # (>1sd)=pin >1 expected move away, unlikely by expiry
         elif isinstance(level, (int, float)) and level > 0 and E is not None:

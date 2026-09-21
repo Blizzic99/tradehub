@@ -86,6 +86,14 @@ Common terms: `d1 = [ln(S/K) + (r + σ²/2)·T] / (σ·√T)`, `d2 = d1 − σ·
   for a long entry at level 100 → stop 95.00, target 110.00. *(Phase 4 extracted the pure
   `_expected_move(price, atm_iv, dte_years)` helper — now HOOK-COVERED by verify_formulas.py. The
   ∓STOP_K·E / ±TARGET_K·E arithmetic remains inline in compute_trade_mechanics.)*
+- **Magnet-pin target** (`_magnet_target(pin, price, is_long)`): exit a
+  `MAGNET_TARGET_BUFFER_FRAC = 0.20` fraction of the convergence distance BEFORE the pin — long
+  `pin − 0.2·(pin−price)`, short `pin + 0.2·(price−pin)` — so the target always sits strictly between
+  entry and the pin and can never invert. Captures (1−frac)=80% of the move to the pin. House rule
+  (replaces a flat $0.30 offset that exceeded the whole move on low-priced tickers and placed the
+  target below entry). **Worked examples:** `_magnet_target(100, 98, True) = 99.6`;
+  `_magnet_target(100, 102, False) = 100.4`; regression `_magnet_target(13.5, 13.28, True) = 13.456`,
+  which is **> entry 13.28** (the old flat offset gave 13.20, below entry — the bug). HOOK-COVERED.
 
 ---
 

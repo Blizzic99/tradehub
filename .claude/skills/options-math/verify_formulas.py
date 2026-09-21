@@ -71,6 +71,11 @@ check("scanner._best_exit_window(10) multi-day",     asc._best_exit_window(10),
 check("scanner._best_exit_window(1) 0-2 DTE",        asc._best_exit_window(1),
       "same day: best ~9:30-11:30 AM ET, hard exit by ~2:00 PM ET (0-2 DTE theta cliff)", exact=True)
 
+# Magnet-pin profit target (Skill example 6): proportional buffer, always between entry and pin
+check("scanner._magnet_target long (100,98)=99.6",   asc._magnet_target(100, 98, True),   99.6, 1e-9)
+check("scanner._magnet_target short (100,102)=100.4",asc._magnet_target(100, 102, False), 100.4, 1e-9)
+check("scanner._magnet_target no-invert (>entry)",   asc._magnet_target(13.5, 13.28, True) > 13.28, True, exact=True)
+
 _fails = [c for c in _checks if not c[1]]
 _w = max(len(c[0]) for c in _checks)
 for label, ok, actual, expected in _checks:
