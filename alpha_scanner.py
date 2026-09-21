@@ -68,15 +68,19 @@ def _yf_options(stock, retries=1, pause=0.7):
             time.sleep(pause)
     return ()
 
-SCAN_WORKERS = 6   # concurrent yfinance/Polygon fetches per scan phase. Kept moderate: too many
+SCAN_WORKERS = 6   # concurrent YFINANCE fetches per scan phase. Kept moderate: too many
                    # simultaneous yfinance calls (esp. from a shared Streamlit Cloud IP) trip Yahoo's
-                   # bot-detection -> empty frames / HTTP 429. Bump toward 8-10 for a faster LOCAL scan.
+                   # bot-detection -> empty frames / HTTP 429. Used for intraday / blow-off / futures.
+POLYGON_WORKERS = 16   # concurrent POLYGON fetches. The paid options plan has no tight rate cap, so
+                   # the magnet + 30d-IV maps run much wider than yfinance can. Profiled 2026-09-21:
+                   # the 49-ticker magnet+IV scan dropped 13.3s (6 workers) -> 5.7s (16), 49/49 OK.
 
-def _parallel_map(fn, items):
+def _parallel_map(fn, items, workers=None):
     """Thread-pool map preserving input order, propagating the Streamlit context so cached
     fetches work inside workers. Each item is ISOLATED — a worker that raises yields None for THAT
     item instead of collapsing the whole phase to serial (which would re-run everything and re-raise
-    on the bad item). One bad ticker never aborts the scan; callers treat None as a failed item."""
+    on the bad item). One bad ticker never aborts the scan; callers treat None as a failed item.
+    `workers` overrides the pool size (POLYGON_WORKERS for Polygon-only maps); defaults to SCAN_WORKERS."""
     items = list(items)
     if not items:
         return []
@@ -89,7 +93,7 @@ def _parallel_map(fn, items):
         except Exception:
             return None          # isolate this item's failure; caller handles None
     try:
-        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        with ThreadPoolExecutor(max_workers=(workers or SCAN_WORKERS)) as ex:
             return list(ex.map(_wrap, items))
     except Exception:
         return [_wrap(x) for x in items]   # pool couldn't run — serial, still per-item safe
@@ -2663,8 +2667,8 @@ if not st.session_state.initial_scan_done or re_scan:
                      "matter which folder you launch from), or in the app's **Secrets** on Streamlit "
                      "Cloud (deployed). This is NOT a rate-limit or a market-hours issue.")
         with st.spinner("Calculating max pain for watchlist..."):
-            mp_results = _parallel_map(get_max_pain_strike, CORE_WATCHLIST)   # concurrent fetch
-            iv30_map = dict(zip(CORE_WATCHLIST, _parallel_map(_atm_iv_30d, CORE_WATCHLIST)))  # ~30d constant-maturity IV, in parallel
+            mp_results = _parallel_map(get_max_pain_strike, CORE_WATCHLIST, workers=POLYGON_WORKERS)   # Polygon: wide pool
+            iv30_map = dict(zip(CORE_WATCHLIST, _parallel_map(_atm_iv_30d, CORE_WATCHLIST, workers=POLYGON_WORKERS)))  # ~30d IV, Polygon: wide pool
             failed_tickers = []   # tickers with no usable options data (fetch failure / rate-limit / none listed)
             for ticker, res in zip(CORE_WATCHLIST, mp_results):
                 if res is None:                       # worker raised (isolated by _parallel_map)
