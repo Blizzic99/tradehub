@@ -82,9 +82,10 @@ Common terms: `d1 = [ln(S/K) + (r + σ²/2)·T] / (σ·√T)`, `d2 = d1 − σ·
   are unavailable. `STOP_K`/`TARGET_K` are **house risk multipliers** (per spec), not from Hull.
 - Source (of the √T basis): Hull, *Volatility* — the standard deviation of the return over horizon T
   scales as `σ·√T`; `E` is the 1σ price move over the option's life.
-- **Worked example:** `E(price=100, ATM_IV=0.20, DTE_years=0.25) = 100·0.20·√0.25 = 10.00`; for a
-  long entry at level 100 → stop 95.00, target 110.00. *(Documented + reviewed; not yet in the
-  automated hook — see "Coverage" below. When Phase 4 changes this, add it to verify_formulas.py.)*
+- **Worked example:** `_expected_move(price=100, ATM_IV=0.20, DTE_years=0.25) = 100·0.20·√0.25 = 10.00`;
+  for a long entry at level 100 → stop 95.00, target 110.00. *(Phase 4 extracted the pure
+  `_expected_move(price, atm_iv, dte_years)` helper — now HOOK-COVERED by verify_formulas.py. The
+  ∓STOP_K·E / ±TARGET_K·E arithmetic remains inline in compute_trade_mechanics.)*
 
 ---
 
@@ -132,15 +133,29 @@ Common terms: `d1 = [ln(S/K) + (r + σ²/2)·T] / (σ·√T)`, `d2 = d1 − σ·
   with two days [0.10, 0.30] → Percentile `= 100·1/2 = 50`. *(Documented + reviewed; add to the hook
   via a pure `_rank_and_pctl` helper when this is next modified.)*
 
+### 12. Best exit window (Phase 4) — `alpha_scanner._best_exit_window(entry_dte_days)`
+- Formula (house rule, cited reasoning): if `entry_dte_days ≤ 2` → a **time-of-day** rule ("best
+  ~9:30–11:30 AM ET, hard exit by ~2:00 PM ET") because 0–2 DTE theta decay accelerates through the
+  afternoon and spreads widen into the close, concentrating edge + liquidity in the morning. If
+  `> 2 DTE` → a **DTE threshold**: exit/roll at `max(1, round(0.5 × entry_dte_days))`, keeping out of
+  the steep final-stretch decay (time value ∝ √T, so ~30% of remaining value erodes in the last ~40%
+  of the option's life).
+- Source: **Hull**, *The Greek Letters* (Theta) + *Volatility* (√T time-value decay) for the decay
+  rationale; the 50%-of-DTE threshold aligns with **tastytrade**'s ~21-DTE management of ~45-DTE
+  entries (practitioner convention). The 0.5 factor and the specific clock times are a documented
+  house rule, not a textbook constant.
+- **Worked examples:** `_best_exit_window(10) = "exit/roll by ~5 DTE (~50% of the 10-DTE entry)"`;
+  `_best_exit_window(1) = "same day: best ~9:30-11:30 AM ET, hard exit by ~2:00 PM ET (0-2 DTE theta
+  cliff)"`. Pure/testable — HOOK-COVERED by verify_formulas.py.
+
 ---
 
 ## Coverage: what the automated hook checks today
 
 `verify_formulas.py` (run by the hook on every edit of the two modules) numerically verifies the
-**pure, network-free** formula functions: examples **1–5** (BS price, N(·), IV solver, Delta, Gamma)
-and **7–9** (GEX net + regime, skew, P/C). Examples **6, 10, 11** (expected-move/stop-target, max
-pain, IV rank) live inside network-bound or file-bound functions; they are documented here with
-worked examples and are covered by the **quant-reviewer** subagent. When any of those three is next
-modified (e.g. Phase 4 touches the DTE stop/target), extract the pure core into a helper
-(`_expected_move`, `_max_pain_from_oi`, `_rank_and_pctl`) and add it to `verify_formulas.py` in the
-same change — that extraction goes through this same workflow.
+**pure, network-free** formula functions: examples **1–9** (BS price, N(·), IV solver, Delta, Gamma,
+GEX net + regime, skew, P/C), plus **6** (`_expected_move`) and **12** (`_best_exit_window`), both
+extracted to pure helpers in Phase 4. Still NOT automated: **10** (max pain) and **11** (IV rank),
+which live inside network-/file-bound functions — documented here with worked examples and covered by
+the **quant-reviewer** subagent. When either is next modified, extract its pure core
+(`_max_pain_from_oi`, `_rank_and_pctl`) and add it to `verify_formulas.py` in that same change.

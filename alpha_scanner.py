@@ -1734,6 +1734,30 @@ def _fmt_strike(s):
         return "N/A"
     return "$" + (str(int(s)) if float(s).is_integer() else str(round(s, 2)))
 
+def _expected_move(price, atm_iv, dte_years):
+    """Expected 1-sigma underlying move over the option's life: E = price * ATM_IV * sqrt(DTE_years).
+    None if any input is missing / non-positive. Basis: Hull, *Volatility* — the standard deviation of
+    the return over horizon T scales as sigma*sqrt(T). See options-math Skill example 6. Pure/testable."""
+    if atm_iv and dte_years and price and price > 0 and dte_years > 0:
+        return price * atm_iv * sqrt(dte_years)
+    return None
+
+def _best_exit_window(entry_dte_days):
+    """Estimated best exit window for a freshly-opened option (options-math Skill example 12). Pure.
+    Short-dated (<=2 DTE) -> a TIME-OF-DAY rule: on a 0-2 DTE option theta decay accelerates through
+    the afternoon and bid/ask spreads widen into the close, so the directional edge + liquidity sit in
+    the morning. Multi-day (>2 DTE) -> a DTE THRESHOLD: exit/roll at ~50% of the entry DTE (floored at
+    1 day), staying out of the steep final-stretch decay (time value ~ sqrt(T): ~30% of the remaining
+    value erodes in the last ~40% of the option's life). The 50% rule aligns with tastytrade's ~21-DTE
+    management of ~45-DTE entries. Cited: Hull (Theta / sqrt(T) time-value decay); tastytrade (DTE mgmt)."""
+    try:
+        d = int(round(float(entry_dte_days)))
+    except (TypeError, ValueError):
+        return "N/A"
+    if d <= 2:
+        return "same day: best ~9:30-11:30 AM ET, hard exit by ~2:00 PM ET (0-2 DTE theta cliff)"
+    return "exit/roll by ~%d DTE (~50%% of the %d-DTE entry)" % (max(1, round(0.5 * d)), d)
+
 def compute_trade_mechanics(ticker, price, is_long, signal_type, level, magnet_strike=None):
     """Phase-1 computed columns for one signal. Stop/target are DTE-AWARE: sized to the option's
     expected 1-sigma move E = price * ATM_IV * sqrt(DTE_years) -- stop at STOP_K*E (adverse), target
@@ -1743,15 +1767,16 @@ def compute_trade_mechanics(ticker, price, is_long, signal_type, level, magnet_s
     IV/DTE are unavailable. Returns display strings + private fields (_iv/_sugg_strike/_atm_iv).
     Never raises."""
     out = {"Suggested Strike": "N/A", "Est. Delta": "N/A",
-           "Stop Price": "N/A", "Profit Target": "N/A",
+           "Stop Price": "N/A", "Profit Target": "N/A", "Exit Window": "N/A",
            "_iv": None, "_sugg_strike": None, "_atm_iv": None}
     try:
         snap = get_option_chain_snapshot(ticker)
         atm_iv = _atm_iv(snap, price) if snap else None
         dte_years = snap.get("dte_years") if snap else None
         # Expected 1-sigma underlying move ($) over the option's life; None if IV/DTE unavailable.
-        E = (price * atm_iv * sqrt(dte_years)) if (atm_iv and dte_years and price and price > 0
-                                                   and dte_years > 0) else None
+        E = _expected_move(price, atm_iv, dte_years)
+        # Phase 4: estimated best exit window (time-of-day for 0-2 DTE, DTE threshold beyond).
+        out["Exit Window"] = _best_exit_window(dte_years * 365.0) if dte_years else "N/A"
 
         if isinstance(level, (int, float)) and level > 0:
             if E is not None:
@@ -1785,7 +1810,7 @@ def compute_trade_mechanics(ticker, price, is_long, signal_type, level, magnet_s
         pass
     return out
 
-PHASE1_COLS = ["Suggested Strike", "Est. Delta", "Stop Price", "Profit Target"]
+PHASE1_COLS = ["Suggested Strike", "Est. Delta", "Stop Price", "Profit Target", "Exit Window"]
 PHASE2_COLS = ["Trade Readiness", "Readiness Note"]
 
 # Trade-readiness gates I already apply manually (Phase 2). VIX and signal-age are
@@ -2328,6 +2353,69 @@ def _sr_table_summary(df, sentence, heading):
     with st.expander("🔊 " + heading + " — plain-text summary (screen-reader accessible)"):
         st.markdown("\n".join("- " + r for r in rows))
 
+# ============================================================
+# PHASE 5 — ThinkorSwim MANUAL order-ticket instructions. This produces TEXT the user reads and types
+# into TOS themselves. Alpha Scanner NEVER places, modifies, or cancels a live order (hard constraint).
+# ASCII-only so it is safe in Telegram AND the Windows console.
+# ============================================================
+def generate_tos_ticket(symbol, option_type, strike, expiration, stop_underlying,
+                        target_underlying, exit_window, quantity="[your size]", rationale=""):
+    """Return a plain-language, step-by-step MANUAL ThinkorSwim order ticket for one qualifying signal.
+    Fields are in TOS Trade-tab order. Stop/target are UNDERLYING price levels (manage the option off
+    them). Limit price is guidance (use the live ask) -- we never fabricate a premium. The final step
+    is always a manual click by the user; this tool places nothing."""
+    def _v(x):
+        return "-" if x in (None, "", "N/A") else str(x)
+    ot = str(option_type or "").upper() or "-"
+    lines = [
+        "=== ThinkorSwim Order Ticket (MANUAL ENTRY) - %s %s ===" % (_v(symbol), ot),
+        "Trade tab fields, in order:",
+        "  Symbol:        %s" % _v(symbol),
+        "  Option type:   %s%s" % (ot, ("  (" + rationale + ")") if rationale else ""),
+        "  Strike:        %s" % _v(strike),
+        "  Expiration:    %s" % _v(expiration),
+        "  Quantity:      %s   (position sizing is your call; risk per your own rules)" % _v(quantity),
+        "  Order type:    LIMIT   (never MARKET on options)",
+        "  Limit price:   at / just above the live ASK (marketable limit) - check the bid/ask spread first",
+        "  Stop price:    underlying %s   (exit the option if the stock trades through this)" % _v(stop_underlying),
+        "  Profit target: underlying %s" % _v(target_underlying),
+        "  Time-in-force: DAY",
+        "  Exit window:   %s" % _v(exit_window),
+        "",
+        "Walkthrough (generic TOS - confirm the exact tab/button names against your install):",
+        "  1. Open the Trade tab; type the symbol %s." % _v(symbol),
+        "  2. Select the %s expiration." % _v(expiration),
+        "  3. Click the %s %s option row (the ASK to buy)." % (_v(strike), ot),
+        "  4. Set order type = LIMIT and the price at/just above the ask.",
+        "  5. Set Quantity, then set stop/target as conditional orders or manage manually at the",
+        "     underlying levels above.",
+        "  6. Set Time-in-force = DAY.",
+        "  7. Review the confirmation dialog (contract, cost, max loss) carefully.",
+        "  8. YOU click Confirm and Send. Alpha Scanner never places, modifies, or cancels orders.",
+    ]
+    return "\n".join(lines)
+
+def _tos_ticket_from_row(row, signal_type="magnet"):
+    """Build a TOS ticket from a displayed signal row. Long -> CALL, short -> PUT: magnet UP / VWAP /
+    ORB UP are long; magnet DOWN / ORB DOWN / blow-off are short."""
+    direction = str(row.get("Direction", ""))
+    if signal_type == "blowoff":
+        is_long = False
+    elif signal_type == "vwap":
+        is_long = True
+    elif "DOWN" in direction.upper():
+        is_long = False
+    else:
+        is_long = "UP" in direction.upper() or signal_type in ("orb",)
+    ot = "CALL" if is_long else "PUT"
+    why = {"magnet": "converge to the max-pain pin", "vwap": "VWAP reclaim, long bias",
+           "orb": "opening-range breakout", "blowoff": "parabolic blow-off, fade"}.get(signal_type, "")
+    return generate_tos_ticket(
+        symbol=row.get("Ticker"), option_type=ot, strike=row.get("Suggested Strike"),
+        expiration=row.get("Expiry"), stop_underlying=row.get("Stop Price"),
+        target_underlying=row.get("Profit Target"), exit_window=row.get("Exit Window"),
+        rationale=why)
+
 st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -2768,6 +2856,14 @@ if not st.session_state.initial_scan_done or re_scan:
                                r.get("Signal Strength"), r.get("Max Pain Strike"), r.get("Current Price"),
                                r.get("Distance %"), r.get("OI Confidence"), r.get("Trade Readiness"))),
                     "Magnet pin signals")
+                # Phase 5: manual ThinkorSwim order tickets for QUALIFYING signals (Trade Readiness PASS).
+                _qual = df_show[df_show["Trade Readiness"].astype(str).str.contains("PASS", na=False)]
+                if not _qual.empty:
+                    with st.expander("📋 ThinkorSwim order tickets (manual entry) — %d qualifying signal(s)" % len(_qual)):
+                        st.caption("Read these and type them into TOS yourself. Alpha Scanner never "
+                                   "places, modifies, or cancels orders — the last click is always yours.")
+                        for _, _r in _qual.iterrows():
+                            st.code(_tos_ticket_from_row(_r, "magnet"), language="text")
                 st.caption(IV_CAPTION)
                 _ivdays = iv_days_logged()
                 st.caption(("✅ Real logged IV history active (%d days)." % _ivdays)

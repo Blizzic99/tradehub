@@ -64,6 +64,13 @@ _pcr = asc.compute_pcr({"call_vol_total": 1000.0, "put_vol_total": 1500.0})
 check("scanner.compute_pcr ratio = 1500/1000",       _pcr[0],                                    1.5, 1e-9)
 check("scanner.compute_pcr flag (>=1.5)",            _pcr[1],                                    "EXTREME-PUT", exact=True)
 
+# Phase 4: DTE-aware expected move + best-exit-window (Skill examples 6 & 12)
+check("scanner._expected_move(100,0.20,0.25)=1sig",  asc._expected_move(100, 0.20, 0.25),        10.0, 1e-9)
+check("scanner._best_exit_window(10) multi-day",     asc._best_exit_window(10),
+      "exit/roll by ~5 DTE (~50% of the 10-DTE entry)", exact=True)
+check("scanner._best_exit_window(1) 0-2 DTE",        asc._best_exit_window(1),
+      "same day: best ~9:30-11:30 AM ET, hard exit by ~2:00 PM ET (0-2 DTE theta cliff)", exact=True)
+
 _fails = [c for c in _checks if not c[1]]
 _w = max(len(c[0]) for c in _checks)
 for label, ok, actual, expected in _checks:
