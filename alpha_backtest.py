@@ -5,7 +5,7 @@ can be verified before any strategy logic is built on top of it.
 
 Design mirrors `_intraday_polygon` / `_normalize_intraday` in alpha_scanner.py:
   - endpoint  /v2/aggs/ticker/{ticker}/range/1/minute/{from}/{to}
-  - request   adjusted=true, sort=asc, limit=50000, apiKey=...
+  - request   adjusted=true, sort=asc, limit=50000 (key sent as an Authorization: Bearer header)
   - output    tz-aware America/New_York index, lowercase o/h/l/c/v, regular hours 09:30-16:00
 Differences: it paginates the FULL date range via Polygon's `next_url`, throttles for the
 free tier, and keeps every session in the range (not just the most recent one).
@@ -98,6 +98,45 @@ def _polygon_key():
     return os.environ.get("POLYGON_API_KEY") or _secret("POLYGON_KEY")
 
 
+POLYGON_HOST = "api.polygon.io"
+
+
+def _is_polygon_url(url):
+    """True only for https://api.polygon.io URLs — the one place the Polygon key may ever be sent.
+    Identical to alpha_scanner._is_polygon_url (a parity test enforces it): rejects backslash, '@',
+    whitespace/control/non-ASCII, and requires urllib AND urllib3 (the parser requests connects with)
+    to agree on https + api.polygon.io + port 443/default, defeating parser-differential bypasses like
+    'https://evil.com\\@api.polygon.io/' (urllib: polygon; urllib3/requests: evil.com)."""
+    try:
+        import urllib.parse
+        s = str(url)
+        if (not s or not s.isascii() or "\\" in s or "@" in s
+                or any(ord(ch) <= 32 or ord(ch) == 127 for ch in s)):
+            return False
+        p = urllib.parse.urlsplit(s)
+        if (p.scheme != "https" or p.hostname != POLYGON_HOST or p.port not in (None, 443)
+                or p.username or p.password):
+            return False
+        from urllib3.util import parse_url
+        u = parse_url(s)
+        return (u.scheme == "https" and (u.host or "").lower() == POLYGON_HOST
+                and u.port in (None, 443) and not u.auth)
+    except Exception:
+        return False
+
+
+def _polygon_request(url, key, params=None, timeout=15):
+    """GET a Polygon endpoint with the key in an `Authorization: Bearer` header — never in the URL, so
+    it cannot appear in exception text, logs, or next_url strings. Refuses (ValueError; the message
+    deliberately excludes the URL) any URL that is not https://api.polygon.io, which also guards
+    next_url pagination. Mirrors alpha_scanner._polygon_get; requests drops Authorization on
+    cross-host redirects."""
+    if not _is_polygon_url(url):
+        raise ValueError("refusing to send the Polygon key to a non-Polygon URL")
+    return requests.get(url, params=params, timeout=timeout,
+                        headers={"Authorization": "Bearer " + (key or "")})
+
+
 # ------------------------------------------------------------------
 # Normalization (keeps ALL sessions in range, unlike the scanner's last-session-only variant)
 # ------------------------------------------------------------------
@@ -122,8 +161,8 @@ def _normalize(df):
 def fetch_minute_history(ticker, start_date, end_date, throttle_seconds=12, timeout=30, api_key=None):
     """Pull 1-minute bars for `ticker` from Polygon over [start_date, end_date] inclusive.
 
-    Paginates the full range via Polygon's `next_url` (appending the api key to each follow-up
-    request, since next_url omits it), so it returns every bar in the window rather than just the
+    Paginates the full range via Polygon's `next_url` (the key rides in the Authorization header on
+    every page; next_url is only followed on api.polygon.io), so it returns every bar in the window rather than just the
     first 50000. Throttles to `throttle_seconds` between requests (default 12s ≈ 5 req/min) so it
     works on the Polygon free tier.
 
@@ -145,14 +184,14 @@ def fetch_minute_history(ticker, start_date, end_date, throttle_seconds=12, time
 
     frm, to = _fmt(start_date), _fmt(end_date)
     url = POLYGON_BASE_URL + "/v2/aggs/ticker/" + ticker + "/range/1/minute/" + frm + "/" + to
-    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": key}
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000}
 
     rows = []
     retries = 0
     while url:
         _poly_throttle(throttle_seconds)   # global pace: every Polygon request in this process
                                            # (first pages, follow-up pages, and other tickers alike)
-        resp = requests.get(url, params=params, timeout=timeout)
+        resp = _polygon_request(url, key, params=params, timeout=timeout)
         if resp.status_code == 429:        # rate-limited: back off and retry the SAME page.
             retries += 1                   # (One unhandled 429 used to cascade — each failed ticker
             if retries > 4:                #  fired the next request immediately, so 44/49 died.)
@@ -170,9 +209,13 @@ def fetch_minute_history(ticker, start_date, end_date, throttle_seconds=12, time
         j = resp.json()
         rows.extend(j.get("results", []) or [])
         next_url = j.get("next_url")
+        if next_url and not _is_polygon_url(next_url):
+            # Never send the key off api.polygon.io, and never return a silently TRUNCATED history.
+            raise RuntimeError("Polygon returned a next_url off api.polygon.io for %s %s..%s; refusing to follow"
+                               % (ticker, frm, to))
         if next_url:
             url = next_url
-            params = {"apiKey": key}   # next_url already carries limit/sort/adjusted; only add the key
+            params = None              # next_url already carries limit/sort/adjusted; the key rides in the header
         else:
             url = None
 
@@ -894,11 +937,11 @@ def _fetch_daily_closes(ticker, start_date, end_date, throttle_seconds=12, timeo
     frm = start_date if isinstance(start_date, str) else start_date.strftime("%Y-%m-%d")
     to = end_date if isinstance(end_date, str) else end_date.strftime("%Y-%m-%d")
     url = POLYGON_BASE_URL + "/v2/aggs/ticker/" + ticker + "/range/1/day/" + frm + "/" + to
-    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": key}
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000}
     retries = 0
     while True:
         _poly_throttle(throttle_seconds)
-        resp = requests.get(url, params=params, timeout=timeout)
+        resp = _polygon_request(url, key, params=params, timeout=timeout)
         if resp.status_code == 429:
             retries += 1
             if retries > 4:
@@ -1317,13 +1360,13 @@ def _expiry_strikes(ticker, exp_str, key):
     strikes = []
     exp_past = date.fromisoformat(exp_str) < date.today()
     url = POLYGON_BASE_URL + "/v3/reference/options/contracts"
-    params = {"apiKey": key, "underlying_ticker": ticker, "expiration_date": exp_str,
+    params = {"underlying_ticker": ticker, "expiration_date": exp_str,
               "contract_type": "call", "expired": "true" if exp_past else "false", "limit": 250}
     pages = 0
     while url and pages < 6:
         _poly_throttle(0.15)
         try:
-            j = requests.get(url, params=params, timeout=15).json()
+            j = _polygon_request(url, key, params=params, timeout=15).json()   # off-host next_url -> ValueError -> break
         except Exception:
             break
         for c in (j.get("results") or []):
@@ -1332,7 +1375,7 @@ def _expiry_strikes(ticker, exp_str, key):
             except Exception:
                 pass
         nxt = j.get("next_url")
-        url, params, pages = (nxt, {"apiKey": key}, pages + 1) if nxt else (None, params, pages)
+        url, params, pages = (nxt, None, pages + 1) if nxt else (None, params, pages)   # next_url carries its query
     strikes = sorted(set(strikes))
     _STRIKE_CACHE[ck] = strikes
     return strikes
@@ -1378,10 +1421,10 @@ def backfill_iv_history(tickers, days_step=3, window_days=365, min_dte=21,
     for ti, tk in enumerate(tickers, 1):
         try:                                        # whole-ticker isolation: one bad ticker (a data
             _poly_throttle(0.15)                    # quirk, a transient error) is SKIPPED, never fatal
-            j = requests.get(POLYGON_BASE_URL + "/v2/aggs/ticker/%s/range/1/day/%s/%s"
-                             % (tk, start.isoformat(), today.isoformat()),
-                             params={"apiKey": key, "adjusted": "true", "sort": "asc", "limit": 50000},
-                             timeout=20).json()
+            j = _polygon_request(POLYGON_BASE_URL + "/v2/aggs/ticker/%s/range/1/day/%s/%s"
+                                 % (tk, start.isoformat(), today.isoformat()), key,
+                                 params={"adjusted": "true", "sort": "asc", "limit": 50000},
+                                 timeout=20).json()
             closes = {}
             for b in (j.get("results") or []):
                 closes[datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date()] = float(b["c"])
@@ -1408,8 +1451,8 @@ def backfill_iv_history(tickers, days_step=3, window_days=365, min_dte=21,
                     occ = "O:%s%sC%08d" % (tk, exp.isoformat().replace("-", "")[2:], int(round(K * 1000)))
                     _poly_throttle(0.15)
                     try:
-                        a = requests.get(POLYGON_BASE_URL + "/v2/aggs/ticker/%s/range/1/day/%s/%s" % (occ, ds, ds),
-                                         params={"apiKey": key, "adjusted": "true"}, timeout=12).json()
+                        a = _polygon_request(POLYGON_BASE_URL + "/v2/aggs/ticker/%s/range/1/day/%s/%s" % (occ, ds, ds),
+                                             key, params={"adjusted": "true"}, timeout=12).json()
                     except Exception:
                         continue
                     ar = a.get("results") or []

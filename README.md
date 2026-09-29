@@ -56,22 +56,33 @@ pip install -r requirements.txt
 
 ## Setup
 
-1. Copy the secrets template and fill in your own values:
+1. Copy the secrets template to your **user-level** Streamlit folder, which is outside the repo and any
+   synced folder, and fill in your own values:
 
    ```bash
-   cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+   cp .streamlit/secrets.toml.example ~/.streamlit/secrets.toml
    ```
 
-2. Edit `.streamlit/secrets.toml`:
+2. Edit `~/.streamlit/secrets.toml`:
 
    ```toml
    POLYGON_KEY = "your_polygon_api_key_here"
    TELEGRAM_BOT_TOKEN = "your_telegram_bot_token_here"
    TELEGRAM_CHAT_ID = "your_telegram_chat_id_here"
+   TELEGRAM_ALERTS_ENABLED = false
    ```
 
-   `secrets.toml` is git-ignored, so your keys are never committed. Telegram
-   values can be left blank if you don't want alerts.
+   Both the dashboard and the headless tools read it from any working directory. A project-level
+   `.streamlit/secrets.toml` also works and is git-ignored. On Streamlit Community Cloud, paste the
+   same lines into the app's **Settings → Secrets**. Telegram values can be left blank if you don't
+   want alerts.
+
+**Security model.** Credentials come only from secrets or environment variables and are never
+entered in, or sent to, the dashboard UI. The Polygon key travels in an `Authorization: Bearer`
+header and only to `https://api.polygon.io`. The Telegram alerts on/off switch appears only in the
+owner's local session (`tradehub.bat`, bound to `localhost`). Any other session, such as the public
+cloud app, follows `TELEGRAM_ALERTS_ENABLED` and cannot change it. To send a test alert, run
+`python scan_alert.py --send --force`.
 
 ---
 
@@ -82,7 +93,15 @@ streamlit run alpha_scanner.py
 ```
 
 On Windows you can also double-click **`tradehub.bat`**, which launches the
-dashboard on port 8501 from this folder.
+dashboard on port 8501 from this folder, bound to `localhost` so other devices on your
+network can't reach it.
+
+Tests:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
 
 ---
 
@@ -112,10 +131,14 @@ AlphaScanner/
   alpha_backtest.py         # ORB / VWAP backtest engine
   contraction_backtest.py   # a rejected thesis, kept for reference
   premarket_report.py       # standalone CLI pre-market report
+  scan_alert.py             # headless scan -> Telegram alert runner (never places orders)
   requirements.txt
-  tradehub.bat              # Windows launcher
+  requirements-dev.txt      # test-only deps (pytest)
+  pytest.ini
+  tests/                    # security regression + known-answer formula tests
+  tradehub.bat              # Windows launcher (localhost only)
   .streamlit/
-    secrets.toml.example    # copy to secrets.toml and fill in
+    secrets.toml.example    # template; the real file lives in ~/.streamlit/secrets.toml
 ```
 
 Runtime files (`iv_history.json`, `skew_history.json`, `scanner_prefs.json`,

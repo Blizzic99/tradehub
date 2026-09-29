@@ -15,6 +15,7 @@ import requests
 import json
 import os
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from math import log, sqrt
 from statistics import NormalDist
@@ -141,12 +142,78 @@ def _secret(name, default=""):
 
 POLYGON_KEY = _secret("POLYGON_KEY")
 POLYGON_BASE_URL = "https://api.polygon.io"
+POLYGON_HOST = "api.polygon.io"
 
-# Telegram alert settings (loaded from secrets/env — not hard-coded)
+def _is_polygon_url(url):
+    """True only for https://api.polygon.io URLs — the one place the Polygon key may ever be sent.
+    Hardened against URL-PARSER DIFFERENTIALS: 'https://evil.com\\@api.polygon.io/' parses as host
+    api.polygon.io in urllib but CONNECTS to evil.com in urllib3 (what requests uses). So: reject any
+    backslash, '@' (userinfo), whitespace/control or non-ASCII character, and require BOTH urllib and
+    urllib3 to agree on scheme https, host api.polygon.io, and port 443/default."""
+    try:
+        s = str(url)
+        if (not s or not s.isascii() or "\\" in s or "@" in s
+                or any(ord(ch) <= 32 or ord(ch) == 127 for ch in s)):
+            return False
+        p = urllib.parse.urlsplit(s)
+        if (p.scheme != "https" or p.hostname != POLYGON_HOST or p.port not in (None, 443)
+                or p.username or p.password):
+            return False
+        from urllib3.util import parse_url     # the parser requests actually connects with
+        u = parse_url(s)
+        return (u.scheme == "https" and (u.host or "").lower() == POLYGON_HOST
+                and u.port in (None, 443) and not u.auth)
+    except Exception:
+        return False
+
+def _polygon_get(url, params=None, timeout=10):
+    """GET a Polygon endpoint with the key in an `Authorization: Bearer` header — never in the URL, so
+    it can't surface in exception text, server/proxy logs, or next_url strings. Refuses (ValueError,
+    message deliberately excludes the URL) to send the key anywhere but https://api.polygon.io, which
+    also guards pagination against a tampered next_url. requests drops the Authorization header on
+    cross-host redirects. Reads POLYGON_KEY at call time (scan_alert.py sets it after import)."""
+    if not _is_polygon_url(url):
+        raise ValueError("refusing to send the Polygon key to a non-Polygon URL")
+    return requests.get(url, params=params, timeout=timeout,
+                        headers={"Authorization": "Bearer " + (POLYGON_KEY or "")})
+
+# Telegram alert settings — credentials come ONLY from secrets/env (never from a widget, never pre-filled
+# into the page). The alerts on/off switch is offered only in the owner's LOCAL session; any other session
+# follows TELEGRAM_ALERTS_ENABLED from secrets (default false = fail closed). See _alerts_control_mode.
 TELEGRAM_BOT_TOKEN = _secret("TELEGRAM_BOT_TOKEN")   # from BotFather
 TELEGRAM_CHAT_ID = _secret("TELEGRAM_CHAT_ID")       # numeric ID from userinfobot (str is fine for the API)
-ALERTS_ENABLED = True                                # master toggle; can also be changed in sidebar
+TELEGRAM_CONFIGURED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+def _truthy_flag(v):
+    """Parse an on/off secret/env flag FAIL-CLOSED: only 1/true/yes/on (any case, surrounding space, or a
+    TOML boolean true) mean ON; anything else — missing, empty, 'false', a typo — means OFF."""
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+ALERTS_ENABLED_DEFAULT = _truthy_flag(_secret("TELEGRAM_ALERTS_ENABLED", "false"))
 LAST_ALERT_FILE = "last_alert.json"
+
+def _session_is_local():
+    """True ONLY for the owner's local run. Fail-closed: any doubt means 'public'. Local requires BOTH
+    (1) not Streamlit Community Cloud, which serves apps from /mount/src, AND (2) the server bound to a
+    loopback address (tradehub.bat passes --server.address localhost). A server listening on all
+    interfaces is reachable from the network, so it counts as public even on the owner's machine."""
+    # Strip any drive letter before comparing: on Windows abspath('/mount/src/x') is 'C:\\mount\\src\\x',
+    # which a plain prefix test would miss. (A real local path under \mount\src fails closed -> public.)
+    _drive, _rest = os.path.splitdrive(os.path.abspath(__file__))
+    if _rest.replace("\\", "/").startswith("/mount/src/"):
+        return False
+    try:
+        addr = str(st.get_option("server.address") or "").strip().lower()
+    except Exception:
+        return False
+    return addr in ("localhost", "127.0.0.1", "::1")
+
+def _alerts_control_mode(configured, is_local):
+    """'unconfigured' -> no Telegram secrets, alerts off. 'local-toggle' -> secrets present AND the
+    owner's local session: show the checkbox. 'owner-locked' -> secrets present but a public/unknown
+    session: no control, alerts follow TELEGRAM_ALERTS_ENABLED from secrets."""
+    if not configured:
+        return "unconfigured"
+    return "local-toggle" if is_local else "owner-locked"
 
 # Sidebar preference persistence — remembers toggle choices across refreshes AND full page reloads.
 PREFS_FILE = "scanner_prefs.json"
@@ -694,8 +761,7 @@ def _spot_price(ticker):
     free stock tier), so fall back to yfinance's latest close (one light call via the browser session,
     cloud-safe) and finally Polygon's prev close (EOD, entitled) as a stale-but-present backstop."""
     try:
-        pr = requests.get(POLYGON_BASE_URL + "/v2/last/trade/" + ticker,
-                          params={"apiKey": POLYGON_KEY}, timeout=5).json()
+        pr = _polygon_get(POLYGON_BASE_URL + "/v2/last/trade/" + ticker, timeout=5).json()
         if pr.get("status") == "OK" and (pr.get("results") or {}).get("p"):
             return float(pr["results"]["p"])
     except Exception:
@@ -707,8 +773,8 @@ def _spot_price(ticker):
     except Exception:
         pass
     try:
-        pv = requests.get(POLYGON_BASE_URL + "/v2/aggs/ticker/" + ticker + "/prev",
-                          params={"apiKey": POLYGON_KEY, "adjusted": "true"}, timeout=6).json()
+        pv = _polygon_get(POLYGON_BASE_URL + "/v2/aggs/ticker/" + ticker + "/prev",
+                          params={"adjusted": "true"}, timeout=6).json()
         res = pv.get("results") or []
         if res and res[0].get("c"):
             return float(res[0]["c"])
@@ -728,8 +794,8 @@ def _polygon_chain(ticker):
         if not POLYGON_KEY:
             return None
         today = datetime.now().date().isoformat()
-        rr = requests.get(POLYGON_BASE_URL + "/v3/reference/options/contracts",
-                          params={"apiKey": POLYGON_KEY, "underlying_ticker": ticker,
+        rr = _polygon_get(POLYGON_BASE_URL + "/v3/reference/options/contracts",
+                          params={"underlying_ticker": ticker,
                                   "expiration_date.gte": today, "expired": "false",
                                   "sort": "expiration_date", "order": "asc", "limit": 1}, timeout=8)
         exps = rr.json().get("results") or []
@@ -740,10 +806,10 @@ def _polygon_chain(ticker):
         call_vol = put_vol = 0.0
         strikes = set()
         url = POLYGON_BASE_URL + "/v3/snapshot/options/" + ticker
-        params = {"apiKey": POLYGON_KEY, "expiration_date": exp_str, "limit": 250}
+        params = {"expiration_date": exp_str, "limit": 250}
         pages = 0
         while url and pages < 10:
-            resp = requests.get(url, params=params, timeout=15)
+            resp = _polygon_get(url, params=params, timeout=15)
             if resp.status_code != 200:
                 break
             j = resp.json()
@@ -766,7 +832,14 @@ def _polygon_chain(ticker):
                     if iv and 0 < iv < 5: put_iv[k] = float(iv)
                     put_vol += float(vol or 0)
             nxt = j.get("next_url")
-            url, params, pages = (nxt, {"apiKey": POLYGON_KEY}, pages + 1) if nxt else (None, params, pages)
+            if nxt and not _is_polygon_url(nxt):
+                # Never send the key off api.polygon.io, and don't silently compute max pain on a chain
+                # truncated by a refused page: fail this ticker loudly (outer except -> None -> listed as
+                # "no options data"). NOTE (pre-existing, tracked for the Phase-1 correctness audit): a
+                # later page that returns an HTTP error (e.g. 429) still `break`s above and yields a
+                # PARTIAL chain — this guard covers only the off-host case.
+                raise ValueError("off-host next_url")
+            url, params, pages = (nxt, None, pages + 1) if nxt else (None, params, pages)   # next_url carries its own query
         if not strikes:
             return None
         spot = _spot_price(ticker)
@@ -807,8 +880,8 @@ def _atm_iv_30d(ticker):
             y = y if m != 1 else y + 1
         if exp is None:
             return None
-        r = requests.get(POLYGON_BASE_URL + "/v3/snapshot/options/" + ticker,
-                         params={"apiKey": POLYGON_KEY, "expiration_date": exp.isoformat(),
+        r = _polygon_get(POLYGON_BASE_URL + "/v3/snapshot/options/" + ticker,
+                         params={"expiration_date": exp.isoformat(),
                                  "strike_price.gte": round(spot * 0.97, 2),
                                  "strike_price.lte": round(spot * 1.03, 2), "limit": 250}, timeout=12)
         if r.status_code != 200:
@@ -985,7 +1058,7 @@ def _intraday_polygon(ticker):
                 day -= timedelta(days=1)
             ds = day.strftime("%Y-%m-%d")
             url = POLYGON_BASE_URL + "/v2/aggs/ticker/" + ticker + "/range/1/minute/" + ds + "/" + ds
-            r = requests.get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_KEY}, timeout=15)
+            r = _polygon_get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000}, timeout=15)
             j = r.json()
             if j.get("resultsCount"):
                 rows = j["results"]
@@ -2589,29 +2662,36 @@ run_premarket = st.sidebar.checkbox(
 re_scan = st.sidebar.button("REFRESH SCAN")
 
 # Alert settings — tucked into an expander to declutter the sidebar.
+# SECURITY (Phase 0): no widget ever receives a Telegram credential — the token/chat id come only from
+# secrets/env and are never sent to the browser. The on/off switch exists only in the owner's LOCAL
+# session (see _session_is_local); a public session can neither see nor change it and simply follows
+# TELEGRAM_ALERTS_ENABLED from secrets. To send a test alert: `python scan_alert.py --send --force`.
 st.sidebar.divider()
+_alert_mode = _alerts_control_mode(TELEGRAM_CONFIGURED, _session_is_local())
 with st.sidebar.expander("📲 Telegram alerts", expanded=False):
-    enable_alerts = st.checkbox("Enable alerts for new signals",
-                                value=_prefs.get("enable_alerts", ALERTS_ENABLED), key="enable_alerts_sidebar")
-    bot_token = st.text_input("Bot Token", value=TELEGRAM_BOT_TOKEN, type="password", key="bot_token_input")
-    chat_id = st.text_input("Chat ID", value=TELEGRAM_CHAT_ID, key="chat_id_input")
-    # Update globals from the inputs so scanning + the test button use the live values.
-    TELEGRAM_BOT_TOKEN = bot_token
-    TELEGRAM_CHAT_ID = chat_id
+    if _alert_mode == "local-toggle":
+        enable_alerts = st.checkbox("Enable alerts for new signals",
+                                    value=_prefs.get("enable_alerts", ALERTS_ENABLED_DEFAULT),
+                                    key="enable_alerts_sidebar")
+        st.caption("✅ Telegram configured via secrets. Local session — you control alerts here.")
+    elif _alert_mode == "owner-locked":
+        enable_alerts = ALERTS_ENABLED_DEFAULT
+        st.caption("🔒 Alerts are " + ("ON" if enable_alerts else "OFF") + " — set by the app owner in "
+                   "secrets (TELEGRAM_ALERTS_ENABLED). Not adjustable from this session.")
+    else:
+        enable_alerts = False
+        st.caption("⚠️ Telegram is not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing from "
+                   "secrets) — alerts are off.")
     last_alert = load_last_alert()
     if last_alert:
         st.caption(f"Last alert: {last_alert.get('ticker','?')} {last_alert.get('direction','?')} on {last_alert.get('timestamp','?')}")
-    if st.button("🧪 Send Test Alert"):
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            st.error("Bot token and Chat ID are required.")
-        elif send_telegram_alert("✅ Alpha Scanner test alert! If you see this, Telegram alerts are working."):
-            st.success("Test alert sent! Check your Telegram.")
-        else:
-            st.error("Failed to send test alert. Verify your token and chat ID.")
 
-# Persist the toggle choices so a page reload restores them.
+# Persist the toggle choices so a page reload restores them. The alerts choice is saved only from the
+# owner's local toggle — a public/locked session must never overwrite the owner's stored preference.
 save_prefs({"tradeable_only": tradeable_only, "run_intraday": run_intraday,
-            "enable_alerts": enable_alerts, "run_premarket": run_premarket})
+            "enable_alerts": (enable_alerts if _alert_mode == "local-toggle"
+                              else _prefs.get("enable_alerts", ALERTS_ENABLED_DEFAULT)),
+            "run_premarket": run_premarket})
 
 with st.sidebar.expander("Watchlist (" + str(len(CORE_WATCHLIST)) + " tickers)", expanded=False):
     st.write(", ".join(CORE_WATCHLIST))
