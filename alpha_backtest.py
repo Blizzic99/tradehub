@@ -1116,6 +1116,7 @@ def magnet_forward_report(history_path="magnet_history.json", throttle_seconds=1
     print("  - No lookahead: each prediction is scored only after its expiry, vs the close at expiry.")
     print("=" * 96)
     if csv_out:
+        import csv                     # was missing: --magnet-csv failed with "name 'csv' is not defined"
         cols = ["date", "direction", "hold_days", "return_pct", "base_ret",
                 "init_dist", "final_dist", "converged", "gap_closed"]
         try:

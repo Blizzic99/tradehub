@@ -49,3 +49,4 @@ desktop.ini
 backtest_*.csv
 scan_alert_state.json
 .pytest_cache/
+week_*

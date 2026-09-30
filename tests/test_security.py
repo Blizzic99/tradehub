@@ -33,6 +33,7 @@ BACKTEST = os.path.join(ROOT, "alpha_backtest.py")
 SCAN_ALERT = os.path.join(ROOT, "scan_alert.py")
 PREMARKET = os.path.join(ROOT, "premarket_report.py")
 CONTRACTION = os.path.join(ROOT, "contraction_backtest.py")
+REPLAY = os.path.join(ROOT, "live_rules_replay.py")
 SECRET_NAMES = {"POLYGON_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
 SECRET_LOADERS = {"_secret", "_polygon_key"}
 SECRET_ENV_VARS = ("POLYGON_KEY", "POLYGON_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
@@ -44,6 +45,7 @@ VETTED_SINKS = {
     SCANNER: {("_polygon_get", "requests.get"), ("send_telegram_alert", "requests.post")},
     BACKTEST: {("_polygon_request", "requests.get")},
     SCAN_ALERT: set(), PREMARKET: set(), CONTRACTION: set(),
+    REPLAY: {("main", "OptionData")},   # key handed to the options-data client object
 }
 
 
@@ -444,7 +446,7 @@ def secret_override_offenders(src):
     return out
 
 
-@pytest.mark.parametrize("path", [SCANNER, BACKTEST, SCAN_ALERT, PREMARKET, CONTRACTION])
+@pytest.mark.parametrize("path", [SCANNER, BACKTEST, SCAN_ALERT, PREMARKET, CONTRACTION, REPLAY])
 def test_secret_variables_only_assigned_from_secret_loaders(path):
     """Catches the old `TELEGRAM_BOT_TOKEN = bot_token` (a widget overriding a secret) in any form."""
     bad = secret_override_offenders(_read(path))
@@ -572,7 +574,7 @@ def auth_literal_sites(src):
 
 
 @pytest.mark.parametrize("path,allowed", [(SCANNER, {"_polygon_get"}), (BACKTEST, {"_polygon_request"}),
-                                          (SCAN_ALERT, set()), (PREMARKET, set()), (CONTRACTION, set())])
+                                          (SCAN_ALERT, set()), (PREMARKET, set()), (CONTRACTION, set()), (REPLAY, set())])
 def test_auth_headers_are_only_built_inside_the_helpers(path, allowed):
     sites = auth_literal_sites(_read(path))
     assert sites <= allowed, "Authorization/Bearer header built outside the helpers in %s: %s" % (
